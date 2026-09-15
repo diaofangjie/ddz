@@ -308,14 +308,22 @@ class GameLogic {
     // 保存座位排列信息
     room.settings.playerOrder = playerIndices;
 
-    if (playerCount === 4 && room.settings.teamMode === 'random') {
-      const shuffled = [0, 1, 2, 3].sort(() => Math.random() - 0.5);
-      room.settings.playerTeams = {
-        [shuffled[0]]: 'red',
-        [shuffled[1]]: 'red',
-        [shuffled[2]]: 'blue',
-        [shuffled[3]]: 'blue'
-      };
+    // 4 人局必须保证「红蓝各 2 人」的有效分组，否则结算时无法划分胜败方。
+    // 房主选择随机分队、或手动分配不完整时，这里兜底重新随机分配。
+    if (playerCount === 4) {
+      const teams = room.settings.playerTeams || {};
+      const isComplete = room.players.every((_, i) => teams[i] === 'red' || teams[i] === 'blue')
+        && room.players.filter((_, i) => teams[i] === 'red').length === 2;
+
+      if (room.settings.teamMode === 'random' || !isComplete) {
+        const shuffled = [0, 1, 2, 3].sort(() => Math.random() - 0.5);
+        room.settings.playerTeams = {
+          [shuffled[0]]: 'red',
+          [shuffled[1]]: 'red',
+          [shuffled[2]]: 'blue',
+          [shuffled[3]]: 'blue'
+        };
+      }
     }
 
     room.game = {
@@ -324,6 +332,7 @@ class GameLogic {
       landlord: null,
       currentPlayer: Math.floor(Math.random() * playerCount),
       phase: room.settings.mode === '4player' ? 'discarding' : 'calling',
+      callPasses: 0,
       lastPlay: null,
       lastPlayer: null,
       passes: 0,
@@ -367,21 +376,30 @@ class GameLogic {
     if (call) {
       game.baseScore = call;
       game.landlord = playerIndex;
+      game.callPasses = 0;
       game.hands[playerIndex] = this.sortCards([...game.hands[playerIndex], ...game.dipai]);
       game.phase = 'doubling';
       game.multiplier = call;
       game.currentPlayer = (playerIndex + 1) % room.players.length;
     } else {
+      // 不叫：记录一次放弃后轮到下一位
+      game.callPasses = (game.callPasses || 0) + 1;
       game.currentPlayer = (game.currentPlayer + 1) % room.players.length;
 
-      const firstPlayerIndex = Math.floor(Math.random() * room.players.length);
-      if (game.currentPlayer === firstPlayerIndex && game.landlord === null) {
-        game.landlord = 0;
+      // 所有人都选择不叫 → 流局兜底：由首位玩家以 1 分当地主。
+      // 修正前此处用「每次调用重新生成的随机座位」做触发条件，导致兜底可能
+      // 在任意时刻触发，且把地主硬编码为座位 0；现在改为按实际放弃次数判定。
+      if (game.callPasses >= room.players.length && game.landlord === null) {
+        const forcedLandlord = 0;
+        game.landlord = forcedLandlord;
         game.baseScore = 1;
-        game.hands[0] = this.sortCards([...game.hands[0], ...game.dipai]);
-        game.phase = 'doubling';
         game.multiplier = 1;
-        game.currentPlayer = 1;
+        game.hands[forcedLandlord] = this.sortCards([
+          ...game.hands[forcedLandlord],
+          ...game.dipai
+        ]);
+        game.phase = 'doubling';
+        game.currentPlayer = (forcedLandlord + 1) % room.players.length;
       }
     }
   }
@@ -420,7 +438,13 @@ class GameLogic {
 
     if (allDecided) {
       game.phase = 'playing';
-      game.currentPlayer = game.landlord;
+      // 3 人局由地主先出；4 人局没有地主（landlord 为 null），
+      // 此时若直接把 currentPlayer 赋成 landlord 会得到 null，
+      // 后续 room.players[null] 取不到人，牌局会永久卡死。
+      const landlordValid = game.landlord !== null && game.landlord !== undefined;
+      game.currentPlayer = landlordValid
+        ? game.landlord
+        : (game.currentPlayer % room.players.length);
     }
   }
 
@@ -465,7 +489,20 @@ class GameLogic {
 
   handlePlayCards(room, playerId, cards) {
     const game = room.game;
+    if (!game) throw createGameError('当前没有进行中的对局', 'NO_ACTIVE_GAME');
+
     const playerIndex = room.players.findIndex(p => p.id === playerId);
+    if (playerIndex === -1) throw createGameError('你不在这个房间里', 'PLAYER_NOT_IN_ROOM');
+
+    // 阶段校验：此前只校验了"是否轮到你"，导致在叫地主/加倍/弃牌阶段
+    // 也能通过出牌事件改动手牌，属于规则漏洞
+    if (game.phase !== 'playing') {
+      throw createGameError('现在还不到出牌的时候哦~', 'NOT_PLAYING_PHASE');
+    }
+
+    if (!Array.isArray(cards) || cards.length === 0) {
+      throw createGameError('请先选择要出的牌', 'EMPTY_CARDS');
+    }
 
     if (playerIndex !== game.currentPlayer) {
       throw createGameError('还没轮到你出牌呢~', 'NOT_YOUR_TURN');
@@ -551,61 +588,65 @@ class GameLogic {
     return { gameEnded: false };
   }
 
+  /**
+   * 计分（零和守恒）
+   * ------------------------------------------------------------------------
+   * 修正前的实现分别对胜方与败方取整、且胜方收益除以人数，
+   * 在个人加倍倍数不一致时会漂移，导致 sum(scores) !== 0、长期对局分数整体偏移。
+   *
+   * 现采用"奖池"模型，保证严格零和：
+   *   1) 每个输家各付「基础分 × 自己的加倍倍数」，合计为奖池
+   *   2) 奖池按各赢家的加倍倍数权重分配，余数补给权重最高者
+   *   3) sum(scores) 恒等于 0
+   */
   calculateScores(room, winnerIndex) {
     const game = room.game;
     const playerCount = room.players.length;
+    const playerTeams = room.settings.playerTeams || {};
+    const multiplierOf = (i) => game.playerDoublingMultiplier[i] || 1;
+    const allSeats = room.players.map((_, i) => i);
+
     let winnerTeam = [];
     let loserTeam = [];
 
     if (playerCount === 4) {
-      // 2v2模式：根据队伍分配
-      const playerTeams = room.settings.playerTeams || {};
+      // 2v2：按队伍颜色划分
       const winnerTeamColor = playerTeams[winnerIndex];
-
-      winnerTeam = [0, 1, 2, 3].filter(i => playerTeams[i] === winnerTeamColor);
-      loserTeam = [0, 1, 2, 3].filter(i => playerTeams[i] !== winnerTeamColor);
+      winnerTeam = allSeats.filter(i => playerTeams[i] === winnerTeamColor);
+      loserTeam = allSeats.filter(i => playerTeams[i] !== winnerTeamColor);
+    } else if (winnerIndex === game.landlord) {
+      winnerTeam = [game.landlord];
+      loserTeam = allSeats.filter(i => i !== game.landlord);
     } else {
-      // 3人模式
-      const landlordTeam = [game.landlord];
-      const farmerTeam = [0, 1, 2].filter(i => i !== game.landlord);
-      if (winnerIndex === game.landlord) {
-        winnerTeam = landlordTeam;
-        loserTeam = farmerTeam;
-      } else {
-        winnerTeam = farmerTeam;
-        loserTeam = landlordTeam;
-      }
+      winnerTeam = allSeats.filter(i => i !== game.landlord);
+      loserTeam = [game.landlord];
+    }
+
+    // 队伍不完整时不能结算，否则会把分数发给错误的人
+    if (winnerTeam.length === 0 || loserTeam.length === 0
+      || winnerTeam.length + loserTeam.length !== playerCount) {
+      throw createGameError('结算失败：队伍分配不完整', 'INVALID_TEAMS');
     }
 
     const basePoints = game.baseScore * game.multiplier;
-    let scores = [];
 
-    if (playerCount === 4) {
-      // 2v2模式：总积分平分给胜利方
-      const totalWinnerPoints = basePoints * loserTeam.length; // 每个输家支付 basePoints
-      const perWinnerPoints = totalWinnerPoints / winnerTeam.length;
-
-      scores = room.players.map((_, i) => {
-        const multiplier = game.playerDoublingMultiplier[i];
-        if (winnerTeam.includes(i)) {
-          return Math.floor(perWinnerPoints * multiplier);
-        } else {
-          return -Math.floor(basePoints * multiplier);
-        }
-      });
-    } else {
-      // 3人模式：原有逻辑
-      scores = room.players.map((_, i) => {
-        const multiplier = game.playerDoublingMultiplier[i];
-        const playerBasePoints = basePoints * multiplier;
-
-        if (winnerTeam.includes(i)) {
-          return playerBasePoints * loserTeam.length;
-        } else {
-          return -playerBasePoints;
-        }
-      });
+    // 1) 输家付款，汇总成奖池
+    const scores = new Array(playerCount).fill(0);
+    let pot = 0;
+    for (const i of loserTeam) {
+      const payment = Math.round(basePoints * multiplierOf(i));
+      scores[i] = -payment;
+      pot += payment;
     }
+
+    // 2) 奖池按权重分给赢家；余数补给权重最高者，保证严格零和
+    const weightSum = winnerTeam.reduce((sum, i) => sum + multiplierOf(i), 0) || 1;
+    const byWeightDesc = [...winnerTeam].sort((a, b) => multiplierOf(b) - multiplierOf(a));
+    const baseShare = byWeightDesc.map(i => Math.floor((pot * multiplierOf(i)) / weightSum));
+    const remainder = pot - baseShare.reduce((sum, v) => sum + v, 0);
+    byWeightDesc.forEach((seat, idx) => {
+      scores[seat] = baseShare[idx] + (idx === 0 ? remainder : 0);
+    });
 
     scores.forEach((score, i) => {
       game.playerScores[i] += score;
@@ -616,7 +657,15 @@ class GameLogic {
 
   handlePass(room, playerId) {
     const game = room.game;
+    if (!game) throw createGameError('当前没有进行中的对局', 'NO_ACTIVE_GAME');
+
     const playerIndex = room.players.findIndex(p => p.id === playerId);
+    if (playerIndex === -1) throw createGameError('你不在这个房间里', 'PLAYER_NOT_IN_ROOM');
+
+    // 阶段校验：与 handlePlayCards 同理
+    if (game.phase !== 'playing') {
+      throw createGameError('现在还不到出牌的时候哦~', 'NOT_PLAYING_PHASE');
+    }
 
     if (playerIndex !== game.currentPlayer) {
       throw createGameError('还没轮到你出牌呢~', 'NOT_YOUR_TURN');
@@ -731,16 +780,48 @@ class GameLogic {
     }
 
     if (jokers.length === 2) {
-      return jokers;
-    }
-
-    for (const [rank, count] of Object.entries(rankCount)) {
-      if (count >= 4) {
-        return cardsByRank[rank].slice(0, 4);
+      const rocketEval = evaluateHand(jokers, laiziMode !== 'none');
+      if (rocketEval.valid && compareHands(rocketEval, lastPlay)) {
+        // 有普通炸弹能解决就先用普通炸弹，王炸留作底牌
+        const bombFirst = this.pickBomb(rankCount, cardsByRank, lastPlay, laiziMode);
+        return bombFirst || jokers;
       }
     }
 
+    // 炸弹分支：必须像 single/pair 一样做合法性校验后再返回。
+    // 修正前这里无条件返回 4 张同点，在 4 人双副牌模式下
+    // 对手可能是 5~8 张炸弹，compareHands 会判 PLAY_TOO_SMALL，
+    // 进而让"托管/AI 自动出牌"抛错、牌局卡死。
+    const bomb = this.pickBomb(rankCount, cardsByRank, lastPlay, laiziMode);
+    if (bomb) return bomb;
+
     return null;
+  }
+
+  /**
+   * 从手牌里挑一个"真正能压过 lastPlay"的炸弹。
+   * 返回最小够用的组合；找不到返回 null（由调用方决定过牌）。
+   */
+  pickBomb(rankCount, cardsByRank, lastPlay, laiziMode) {
+    const candidates = [];
+    for (const [rank, count] of Object.entries(rankCount)) {
+      if (count >= 4) {
+        // 同点 4~count 张都可能是炸弹；张数要够才能压过更大的炸弹
+        for (let size = 4; size <= count; size++) {
+          candidates.push(cardsByRank[rank].slice(0, size));
+        }
+      }
+    }
+
+    // 优先张数最少的炸弹（省牌），同张数时取点数最低的
+    let best = null;
+    for (const cards of candidates) {
+      const evaluation = evaluateHand(cards, laiziMode !== 'none');
+      if (!evaluation || !evaluation.valid) continue;
+      if (!compareHands(evaluation, lastPlay)) continue;
+      if (!best || cards.length < best.length) best = cards;
+    }
+    return best;
   }
 
   tryStartFromReadyState(room) {

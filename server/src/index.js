@@ -33,6 +33,146 @@ const turnTimers = new Map();
 const roundReadyTimers = new Map();
 const ROUND_READY_TIMEOUT_MS = 30000;
 
+function createError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+/* ============================================================================
+ * 视图裁剪（防作弊核心）
+ * ----------------------------------------------------------------------------
+ * 服务端不再把"房间对象"整体广播出去，而是按观察者逐人裁剪：
+ *   - 只有观察者自己的手牌是真实的
+ *   - 其他人的手牌用"等长占位牌"替代：前端渲染他人牌背时只使用
+ *     hands[i].length，因此等长占位既保留剩余张数显示，又不泄露任何牌面
+ *   - 底牌在确定地主之前不下发
+ * 牌局数据因此从不离开服务端进程。
+ * ========================================================================== */
+
+function hiddenCards(seatIndex, count) {
+  const arr = new Array(count);
+  for (let i = 0; i < count; i++) {
+    arr[i] = {
+      id: `hidden_${seatIndex}_${i}`,
+      rank: 'hidden',
+      suit: 'hidden',
+      isHidden: true
+    };
+  }
+  return arr;
+}
+
+function projectGame(game, viewerIndex) {
+  if (!game) return game;
+
+  const projected = { ...game };
+
+  if (Array.isArray(game.hands)) {
+    projected.hands = game.hands.map((hand, index) => {
+      if (index === viewerIndex) return hand;
+      return hiddenCards(index, Array.isArray(hand) ? hand.length : 0);
+    });
+  }
+
+  // 3 人局底牌：地主确定之前对所有人不可见。
+  // 4 人局本就没有底牌（dipai 为空数组），此处逻辑天然安全。
+  const bottomRevealed = game.landlord !== null && game.landlord !== undefined;
+  projected.dipai = bottomRevealed ? game.dipai : [];
+
+  return projected;
+}
+
+/**
+ * 序列化房间并裁剪到指定观察者可见的范围。
+ * @param {object} room
+ * @param {string|null} viewerId 观察者 playerId；为空时按最严格裁剪（所有人手牌均不可见）
+ */
+function serializeRoom(room, viewerId) {
+  if (!room) return room;
+
+  const viewerIndex = viewerId
+    ? room.players.findIndex((p) => p.id === viewerId)
+    : -1;
+
+  return {
+    id: room.id,
+    players: room.players ? room.players.map((p) => ({ ...p })) : [],
+    settings: room.settings ? { ...room.settings } : {},
+    currentRound: room.currentRound,
+    gameState: room.gameState,
+    game: projectGame(room.game, viewerIndex),
+    readyPlayers: room.readyPlayers instanceof Set
+      ? Array.from(room.readyPlayers)
+      : (Array.isArray(room.readyPlayers) ? room.readyPlayers : []),
+    playerScores: room.playerScores ? { ...room.playerScores } : {},
+    matchHistory: room.matchHistory
+      ? room.matchHistory.map((item) => ({
+        ...item,
+        scores: Array.isArray(item.scores) ? [...item.scores] : [],
+        totals: Array.isArray(item.totals) ? [...item.totals] : []
+      }))
+      : [],
+    lastRoundResult: room.lastRoundResult ? { ...room.lastRoundResult } : null,
+    autoReadyDeadline: room.autoReadyDeadline || null
+  };
+}
+
+/* ============================================================================
+ * 广播：唯一出口
+ * ----------------------------------------------------------------------------
+ * 任何"房间/对局状态"的下发都必须经过 emitPerViewer。
+ * 禁止 io.to(roomId).emit('gameUpdated'|'roomUpdated', ...)：
+ * 那会把同一个未裁剪的对象发给所有人，是手牌泄露与状态不一致（Set 变 {}）的根源。
+ * ========================================================================== */
+
+/** 房间内当前所有连接（含未入座的观察者），并解析其身份 */
+function roomAudience(roomId) {
+  const socketIds = io.sockets.adapter.rooms.get(roomId);
+  if (!socketIds) return [];
+
+  const audience = [];
+  for (const sid of socketIds) {
+    const socket = io.sockets.sockets.get(sid);
+    if (!socket) continue;
+    const playerId = (socket.data && socket.data.playerId)
+      || roomManager.getPlayerIdBySocket(sid)
+      || null;
+    audience.push({ socket, playerId });
+  }
+  return audience;
+}
+
+function emitPerViewer(room, event, extra) {
+  for (const { socket, playerId } of roomAudience(room.id)) {
+    const view = serializeRoom(room, playerId);
+    socket.emit(event, extra ? { ...extra, room: view } : view);
+  }
+}
+
+const broadcastRoomState = (room) => emitPerViewer(room, 'roomUpdated');
+const broadcastGameState = (room) => emitPerViewer(room, 'gameUpdated');
+const broadcastGameStarted = (room) => emitPerViewer(room, 'gameStarted');
+
+/**
+ * 动作类事件统一入口。
+ * 身份只认服务端与 socket 的绑定关系，客户端 payload 里的 playerId 一律忽略，
+ * 从而堵死"伪造他人身份出牌/发言"的漏洞。
+ */
+function authorize(socket, roomId) {
+  const room = roomManager.getRoom(roomId);
+  if (!room) throw createError('房间不存在或已解散', 'ROOM_NOT_FOUND');
+
+  const playerId = (socket.data && socket.data.playerId)
+    || roomManager.getPlayerIdBySocket(socket.id);
+  if (!playerId) throw createError('身份未绑定，请重新进入房间', 'AUTH_REQUIRED');
+
+  const player = room.players.find((p) => p.id === playerId);
+  if (!player) throw createError('你不在这个房间里', 'NOT_IN_ROOM');
+
+  return { room, player, playerId };
+}
+
 function clearTurnTimer(roomId) {
   if (turnTimers.has(roomId)) {
     clearTimeout(turnTimers.get(roomId));
@@ -44,6 +184,71 @@ function clearRoundReadyTimer(roomId) {
   if (roundReadyTimers.has(roomId)) {
     clearTimeout(roundReadyTimers.get(roomId));
     roundReadyTimers.delete(roomId);
+  }
+}
+
+/**
+ * 阶段默认动作：超时 / 离线托管 / AI 三处共用的唯一实现。
+ * 此前这段逻辑在三个函数里各写了一遍，任何规则调整都要改三处且必须保持一致；
+ * 且"算不出牌"时会出现既不推进也不过牌的死锁。
+ */
+function applyDefaultAction(room, player) {
+  const game = room.game;
+  if (!game) return { acted: false };
+
+  switch (game.phase) {
+    case 'calling':
+      gameLogic.handleCallLandlord(room, player.id, 0);
+      return { acted: true };
+
+    case 'doubling':
+      gameLogic.handleDoubling(room, player.id, 'none');
+      return { acted: true };
+
+    case 'discarding':
+      gameLogic.handleDiscard(room, player.id, null);
+      return { acted: true };
+
+    case 'playing': {
+      const playerIndex = room.players.findIndex((p) => p.id === player.id);
+      const hand = game.hands[playerIndex];
+      if (!hand || hand.length === 0) return { acted: false };
+
+      // 上家刚出过牌且不是自己 → 能压则压，压不过就过牌
+      const hasOpponentPlay = !!game.lastPlay && game.lastPlayer !== playerIndex;
+      if (hasOpponentPlay) {
+        const cards = gameLogic.aiDecidePlayCards(hand, game.lastPlay, game.laiziMode);
+        if (cards && cards.length > 0) {
+          // AI 返回的牌必须真正能压过上家；线上曾出现 aiDecidePlayCards 返回的牌
+          // 被 handlePlayCards 判为 PLAY_TOO_SMALL 而抛错，导致托管直接崩溃、牌局卡死。
+          // 这里以"能否合法出牌"为准，失败一律降级为过牌，保证状态机永远能推进。
+          try {
+            const result = gameLogic.handlePlayCards(room, player.id, cards);
+            return { acted: true, result };
+          } catch (e) {
+            gameLogic.handlePass(room, player.id);
+            return { acted: true };
+          }
+        }
+        gameLogic.handlePass(room, player.id);
+        return { acted: true };
+      }
+
+      // 必须带头出牌：优先用 AI 决策，兜底出最小的一张（手牌已按点数降序），避免牌局卡死
+      const leading = gameLogic.aiDecidePlayCards(hand, null, game.laiziMode);
+      const cards = (leading && leading.length > 0) ? leading : [hand[hand.length - 1]];
+      try {
+        const result = gameLogic.handlePlayCards(room, player.id, cards);
+        return { acted: true, result };
+      } catch (e) {
+        // 带头出牌理论上不会失败；仍然兜底出最小单张，绝不让自动行动抛错
+        const result = gameLogic.handlePlayCards(room, player.id, [hand[hand.length - 1]]);
+        return { acted: true, result };
+      }
+    }
+
+    default:
+      return { acted: false };
   }
 }
 
@@ -65,47 +270,21 @@ function startTurnTimer(roomId) {
     try {
       const currentRoom = roomManager.getRoom(roomId);
       if (!currentRoom || !currentRoom.game) return;
+      // 期间状态已推进则本次超时作废，避免竞态下重复操作
       if (currentRoom.game.currentPlayer !== currentPlayerIndex || currentRoom.game.phase !== phase) return;
 
       const currentPlayer = currentRoom.players[currentPlayerIndex];
       console.log(`玩家 ${currentPlayer.name} 超时，自动操作`);
 
-      if (currentRoom.game.phase === 'calling') {
-        gameLogic.handleCallLandlord(currentRoom, currentPlayer.id, 0);
-        io.to(roomId).emit('gameUpdated', currentRoom);
+      const { acted, result } = applyDefaultAction(currentRoom, currentPlayer);
+      if (!acted) return;
+
+      if (result && result.gameEnded) {
+        concludeRound(roomId, result);
+      } else {
+        broadcastGameState(currentRoom);
         startTurnTimer(roomId);
         handleAIAction(roomId);
-      } else if (currentRoom.game.phase === 'doubling') {
-        gameLogic.handleDoubling(currentRoom, currentPlayer.id, 'none');
-        io.to(roomId).emit('gameUpdated', currentRoom);
-        startTurnTimer(roomId);
-        handleAIAction(roomId);
-      } else if (currentRoom.game.phase === 'discarding') {
-        gameLogic.handleDiscard(currentRoom, currentPlayer.id, null);
-        io.to(roomId).emit('gameUpdated', currentRoom);
-        startTurnTimer(roomId);
-        handleAIAction(roomId);
-      } else if (currentRoom.game.phase === 'playing') {
-        if (currentRoom.game.lastPlay && currentRoom.game.lastPlayer !== currentPlayerIndex) {
-          gameLogic.handlePass(currentRoom, currentPlayer.id);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          startTurnTimer(roomId);
-          handleAIAction(roomId);
-        } else {
-          // 必须出牌时，出一张最小的
-          const hand = currentRoom.game.hands[currentPlayerIndex];
-          if (hand && hand.length > 0) {
-            const cardsToPlay = [hand[hand.length - 1]];
-            const result = gameLogic.handlePlayCards(currentRoom, currentPlayer.id, cardsToPlay);
-            if (result.gameEnded) {
-              concludeRound(roomId, result);
-            } else {
-              io.to(roomId).emit('gameUpdated', currentRoom);
-              startTurnTimer(roomId);
-              handleAIAction(roomId);
-            }
-          }
-        }
       }
     } catch (error) {
       console.error('超时操作失败:', error);
@@ -115,35 +294,8 @@ function startTurnTimer(roomId) {
   turnTimers.set(roomId, timeoutId);
 }
 
-// 帮助函数：在发送room给客户端之前，转换Set为数组
-const serializeRoom = (room) => {
-  if (!room) return room;
-
-  // 手动构建序列化对象，避免 JSON.parse(JSON.stringify()) 的问题
-  const serialized = {
-    id: room.id,
-    players: room.players ? [...room.players] : [],
-    settings: room.settings ? { ...room.settings } : {},
-    currentRound: room.currentRound,
-    gameState: room.gameState,
-    game: room.game,
-    readyPlayers: room.readyPlayers && room.readyPlayers instanceof Set ? Array.from(room.readyPlayers) :
-      Array.isArray(room.readyPlayers) ? room.readyPlayers : [],
-    playerScores: room.playerScores ? { ...room.playerScores } : {},
-    matchHistory: room.matchHistory ? room.matchHistory.map(item => ({
-      ...item,
-      scores: Array.isArray(item.scores) ? [...item.scores] : [],
-      totals: Array.isArray(item.totals) ? [...item.totals] : []
-    })) : [],
-    lastRoundResult: room.lastRoundResult ? { ...room.lastRoundResult } : null,
-    autoReadyDeadline: room.autoReadyDeadline || null
-  };
-
-  return serialized;
-};
-
 function syncRoomState(room) {
-  io.to(room.id).emit('roomUpdated', serializeRoom(room));
+  broadcastRoomState(room);
 }
 
 function startPreparedRound(roomId) {
@@ -153,7 +305,7 @@ function startPreparedRound(roomId) {
   clearRoundReadyTimer(roomId);
   clearTurnTimer(roomId);
   syncRoomState(room);
-  io.to(room.id).emit('gameStarted', serializeRoom(room));
+  broadcastGameStarted(room);
   startTurnTimer(room.id);
   handleAIAction(room.id);
   broadcastRoomList();
@@ -213,12 +365,9 @@ function concludeRound(roomId, result) {
 
   if (isAllComplete) {
     const finalSettlement = gameLogic.buildFinalSettlement(room, result);
+    // 先结算再重置：buildFinalSettlement 依赖 playerScores / matchHistory
     gameLogic.resetAfterMatch(room);
-    io.to(room.id).emit('gameEnded', {
-      ...result,
-      ...finalSettlement,
-      room: serializeRoom(room)
-    });
+    emitPerViewer(room, 'gameEnded', { ...result, ...finalSettlement });
     syncRoomState(room);
     broadcastRoomList();
     return;
@@ -228,174 +377,61 @@ function concludeRound(roomId, result) {
   scheduleAutoReady(roomId);
   syncRoomState(room);
 
-  io.to(room.id).emit('roundEnded', {
-    ...result,
-    ...roundSummary,
-    isRoundEnd: true,
-    room: serializeRoom(room)
-  });
+  emitPerViewer(room, 'roundEnded', { ...result, ...roundSummary, isRoundEnd: true });
 
   broadcastRoomList();
 }
 
-function handleOfflinePlayerAction(roomId) {
-  const room = roomManager.getRoom(roomId);
-  if (!room || !room.game) return;
-
-  const currentPlayerIndex = room.game.currentPlayer;
-  const currentPlayer = room.players[currentPlayerIndex];
-
-  if (currentPlayer && currentPlayer.isOffline) {
-    setTimeout(() => {
-      try {
-        // 重新检查房间状态，避免竞态条件
-        const currentRoom = roomManager.getRoom(roomId);
-        if (!currentRoom || !currentRoom.game) return;
-        if (currentRoom.game.currentPlayer !== currentPlayerIndex) return;
-
-        if (currentRoom.game.phase === 'calling') {
-          console.log(`离线玩家 ${currentPlayer.name} 自动不叫地主`);
-          gameLogic.handleCallLandlord(currentRoom, currentPlayer.id, 0);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleOfflinePlayerAction(roomId);
-        } else if (currentRoom.game.phase === 'doubling') {
-          console.log(`离线玩家 ${currentPlayer.name} 自动选择不加倍`);
-          gameLogic.handleDoubling(currentRoom, currentPlayer.id, 'none');
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleOfflinePlayerAction(roomId);
-        } else if (currentRoom.game.phase === 'discarding') {
-          console.log(`离线玩家 ${currentPlayer.name} 自动选择不弃牌`);
-          gameLogic.handleDiscard(currentRoom, currentPlayer.id, null);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleOfflinePlayerAction(roomId);
-        } else if (currentRoom.game.phase === 'playing') {
-          console.log(`离线玩家 ${currentPlayer.name} 自动出牌/不出`);
-          if (currentRoom.game.lastPlay && currentRoom.game.lastPlayer !== currentPlayerIndex) {
-            gameLogic.handlePass(currentRoom, currentPlayer.id);
-            io.to(roomId).emit('gameUpdated', currentRoom);
-            handleOfflinePlayerAction(roomId);
-          } else {
-            // 使用AI逻辑来决定出什么牌
-            const cardsToPlay = gameLogic.aiDecidePlayCards(
-              currentRoom.game.hands[currentPlayerIndex],
-              currentRoom.game.lastPlay,
-              currentRoom.game.laiziMode
-            );
-
-            if (cardsToPlay && cardsToPlay.length > 0) {
-              const result = gameLogic.handlePlayCards(currentRoom, currentPlayer.id, cardsToPlay);
-              if (result.gameEnded) {
-                concludeRound(roomId, result);
-              } else {
-                io.to(roomId).emit('gameUpdated', currentRoom);
-                handleOfflinePlayerAction(roomId);
-              }
-            } else {
-              // 如果AI没找到合适的牌，就随便出一张最小的
-              const hand = currentRoom.game.hands[currentPlayerIndex];
-              if (hand.length > 0) {
-                const cardsToPlay = [hand[hand.length - 1]];
-                const result = gameLogic.handlePlayCards(currentRoom, currentPlayer.id, cardsToPlay);
-                if (result.gameEnded) {
-                  concludeRound(roomId, result);
-                } else {
-                  io.to(roomId).emit('gameUpdated', currentRoom);
-                  handleOfflinePlayerAction(roomId);
-                }
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('离线玩家行动失败:', error);
-      }
-    }, 1500); // 增加延迟，给玩家一些重连的时间
-  }
-}
-
-function broadcastRoomList() {
-  const roomList = roomManager.getRoomList();
-  io.emit('roomListUpdated', roomList);
-}
-
-// 处理 AI 自动行动
+/**
+ * 推进到"需要人类操作"为止。
+ * 离线玩家与 AI 玩家共用同一套默认动作，且每次动作后必定再次推进，
+ * 保证任何情况下局面都能往前走（不会因为算不出牌而卡死）。
+ */
 function handleAIAction(roomId) {
   const room = roomManager.getRoom(roomId);
   if (!room || !room.game) return;
 
   const currentPlayerIndex = room.game.currentPlayer;
   const currentPlayer = room.players[currentPlayerIndex];
+  if (!currentPlayer) return;
 
-  // 优先处理离线玩家
-  if (currentPlayer && currentPlayer.isOffline) {
-    console.log(`玩家 ${currentPlayer.name} 离线，启用离线处理`);
-    handleOfflinePlayerAction(roomId);
-    return;
-  }
+  const shouldAutoAct = currentPlayer.isOffline || currentPlayer.isAI;
+  if (!shouldAutoAct) return;
 
-  // 如果当前玩家是 AI，就自动行动
-  if (currentPlayer && currentPlayer.isAI) {
-    console.log(`AI玩家 ${currentPlayer.name} 准备行动`);
-    setTimeout(() => {
-      try {
-        // 重新检查房间和玩家状态，避免竞态条件
-        const currentRoom = roomManager.getRoom(roomId);
-        if (!currentRoom || !currentRoom.game) return;
-        if (currentRoom.game.currentPlayer !== currentPlayerIndex) return;
+  // 离线多等一会儿，给重连留时间；AI 快一点，让节奏自然
+  const delay = currentPlayer.isOffline ? 1500 : 1000;
 
-        if (currentRoom.game.phase === 'calling') {
-          // 叫地主阶段
-          const hand = currentRoom.game.hands[currentPlayerIndex];
-          const call = gameLogic.aiDecideCallLandlord(hand);
-          console.log(`AI玩家 ${currentPlayer.name} ${call > 0 ? '叫' + call + '分' : '不叫'}`);
-          gameLogic.handleCallLandlord(currentRoom, currentPlayer.id, call);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleAIAction(roomId);
-        } else if (currentRoom.game.phase === 'doubling') {
-          // 加倍阶段
-          const doublingType = Math.random() > 0.5 ? 'normal' : 'none';
-          console.log(`AI玩家 ${currentPlayer.name} 选择${doublingType === 'normal' ? '加倍' : '不加倍'}`);
-          gameLogic.handleDoubling(currentRoom, currentPlayer.id, doublingType);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleAIAction(roomId);
-        } else if (currentRoom.game.phase === 'discarding') {
-          // 弃牌阶段
-          console.log(`AI玩家 ${currentPlayer.name} 自动选择不弃牌`);
-          gameLogic.handleDiscard(currentRoom, currentPlayer.id, null);
-          io.to(roomId).emit('gameUpdated', currentRoom);
-          handleAIAction(roomId);
-        } else if (currentRoom.game.phase === 'playing') {
-          // 出牌阶段
-          const hand = currentRoom.game.hands[currentPlayerIndex];
-          const lastPlay = currentRoom.game.lastPlay;
-          const laiziMode = currentRoom.game.laiziMode;
+  setTimeout(() => {
+    try {
+      const currentRoom = roomManager.getRoom(roomId);
+      if (!currentRoom || !currentRoom.game) return;
+      if (currentRoom.game.currentPlayer !== currentPlayerIndex) return;
 
-          const cardsToPlay = gameLogic.aiDecidePlayCards(hand, lastPlay, laiziMode);
+      const actor = currentRoom.players[currentPlayerIndex];
+      if (!actor) return;
 
-          if (cardsToPlay && cardsToPlay.length > 0) {
-            console.log(`AI玩家 ${currentPlayer.name} 出牌`);
-            const result = gameLogic.handlePlayCards(currentRoom, currentPlayer.id, cardsToPlay);
+      console.log(actor.isOffline
+        ? `玩家 ${actor.name} 离线，启用托管`
+        : `AI 玩家 ${actor.name} 行动`);
 
-            if (result.gameEnded) {
-              concludeRound(roomId, result);
-            } else {
-              io.to(roomId).emit('gameUpdated', currentRoom);
-              handleAIAction(roomId);
-            }
-          } else {
-            if (lastPlay && currentRoom.game.lastPlayer !== currentPlayerIndex) {
-              console.log(`AI玩家 ${currentPlayer.name} 不出`);
-              gameLogic.handlePass(currentRoom, currentPlayer.id);
-              io.to(roomId).emit('gameUpdated', currentRoom);
-              handleAIAction(roomId);
-            }
-          }
-        }
-      } catch (error) {
-        console.error('AI 行动失败:', error);
+      const { acted, result } = applyDefaultAction(currentRoom, actor);
+      if (!acted) return;
+
+      if (result && result.gameEnded) {
+        concludeRound(roomId, result);
+      } else {
+        broadcastGameState(currentRoom);
+        startTurnTimer(roomId);
+        handleAIAction(roomId);
       }
-    }, 1000); // 延迟 1 秒，让游戏看起来更自然
-  }
+    } catch (error) {
+      console.error('自动行动失败:', error);
+    }
+  }, delay);
+}
+
+function broadcastRoomList() {
+  io.emit('roomListUpdated', roomManager.getRoomList());
 }
 
 app.get('/health', (req, res) => {
@@ -415,82 +451,89 @@ io.on('connection', (socket) => {
 
   socket.on('createRoom', (data) => {
     try {
+      if (!data || !data.player || !data.player.id) {
+        throw createError('缺少玩家信息', 'INVALID_PLAYER');
+      }
       const room = roomManager.createRoom(data, socket.id);
+      socket.data.playerId = data.player.id;
       socket.join(room.id);
-      socket.emit('roomCreated', serializeRoom(room));
+      socket.emit('roomCreated', serializeRoom(room, data.player.id));
       broadcastRoomList();
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'CREATE_ROOM_FAILED' });
     }
   });
 
   socket.on('joinRoom', (data) => {
     try {
+      if (!data || !data.player || !data.player.id) {
+        throw createError('缺少玩家信息', 'INVALID_PLAYER');
+      }
       const room = roomManager.joinRoom(data.roomId, data.player, socket.id);
+      socket.data.playerId = data.player.id;
       socket.join(room.id);
-      io.to(room.id).emit('roomUpdated', serializeRoom(room));
-      socket.emit('joinedRoom', serializeRoom(room));
+      broadcastRoomState(room);
+      socket.emit('joinedRoom', serializeRoom(room, data.player.id));
       broadcastRoomList();
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'JOIN_ROOM_FAILED' });
     }
   });
 
   socket.on('leaveRoom', (data) => {
     try {
-      const room = roomManager.leaveRoom(data.roomId, data.playerId);
-      if (room) {
-        socket.leave(room.id);
-        io.to(room.id).emit('roomUpdated', serializeRoom(room));
+      const { room, playerId } = authorize(socket, data.roomId);
+      const updatedRoom = roomManager.leaveRoom(room.id, playerId);
+      socket.leave(room.id);
+      if (updatedRoom) {
+        broadcastRoomState(updatedRoom);
       }
+      delete socket.data.playerId;
       socket.emit('leftRoom');
       broadcastRoomList();
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'LEAVE_ROOM_FAILED' });
     }
   });
 
   socket.on('startGame', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-      if (room.players[0]?.id !== data.playerId) {
-        throw new Error('只有房主可以开始游戏');
+      const { room, playerId } = authorize(socket, data.roomId);
+
+      if (room.players[0]?.id !== playerId) {
+        throw createError('只有房主可以开始游戏', 'NOT_HOST');
       }
       if (room.gameState === 'playing' && room.game) {
-        throw new Error('当前对局进行中，无法重复开始');
+        throw createError('当前对局进行中，无法重复开始', 'ALREADY_PLAYING');
       }
-
       if (!roomManager.canStartGame(room)) {
-        throw new Error('人数不足，无法开始游戏');
+        throw createError('人数不足，无法开始游戏', 'NOT_ENOUGH_PLAYERS');
       }
 
       if (room.currentRound > 1 && room.gameState === 'waiting') {
         const readyResult = gameLogic.tryStartFromReadyState(room);
         if (!readyResult.shouldStart) {
-          throw new Error('请等待所有在线玩家准备完成后再开始下一局');
+          throw createError('请等待所有在线玩家准备完成后再开始下一局', 'WAITING_READY');
         }
       } else {
         gameLogic.startGame(room);
       }
 
       startTurnTimer(room.id);
-      io.to(room.id).emit('gameStarted', serializeRoom(room));
+      broadcastGameStarted(room);
       handleAIAction(room.id);
       broadcastRoomList();
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'START_GAME_FAILED' });
     }
   });
 
   socket.on('doubling', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      gameLogic.handleDoubling(room, data.playerId, data.doublingType);
+      const { room, playerId } = authorize(socket, data.roomId);
+      gameLogic.handleDoubling(room, playerId, data.doublingType);
       startTurnTimer(room.id);
-      io.to(room.id).emit('gameUpdated', serializeRoom(room));
+      broadcastGameState(room);
       handleAIAction(room.id);
     } catch (error) {
       socket.emit('gameError', { message: error.message, code: error.code || 'GAME_ACTION_FAILED' });
@@ -499,12 +542,10 @@ io.on('connection', (socket) => {
 
   socket.on('discard', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      gameLogic.handleDiscard(room, data.playerId, data.cardId);
+      const { room, playerId } = authorize(socket, data.roomId);
+      gameLogic.handleDiscard(room, playerId, data.cardId);
       startTurnTimer(room.id);
-      io.to(room.id).emit('gameUpdated', serializeRoom(room));
+      broadcastGameState(room);
       handleAIAction(room.id);
     } catch (error) {
       socket.emit('gameError', { message: error.message, code: error.code || 'GAME_ACTION_FAILED' });
@@ -513,13 +554,10 @@ io.on('connection', (socket) => {
 
   socket.on('callLandlord', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      gameLogic.handleCallLandlord(room, data.playerId, data.call);
+      const { room, playerId } = authorize(socket, data.roomId);
+      gameLogic.handleCallLandlord(room, playerId, data.call);
       startTurnTimer(room.id);
-      io.to(room.id).emit('gameUpdated', serializeRoom(room));
-      // 触发 AI 行动
+      broadcastGameState(room);
       handleAIAction(room.id);
     } catch (error) {
       socket.emit('gameError', { message: error.message, code: error.code || 'GAME_ACTION_FAILED' });
@@ -528,17 +566,14 @@ io.on('connection', (socket) => {
 
   socket.on('playCards', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      const result = gameLogic.handlePlayCards(room, data.playerId, data.cards);
+      const { room, playerId } = authorize(socket, data.roomId);
+      const result = gameLogic.handlePlayCards(room, playerId, data.cards);
 
       if (result.gameEnded) {
         concludeRound(room.id, result);
       } else {
-        io.to(room.id).emit('gameUpdated', serializeRoom(room));
+        broadcastGameState(room);
         startTurnTimer(room.id);
-        // 触发 AI 行动
         handleAIAction(room.id);
       }
     } catch (error) {
@@ -548,69 +583,73 @@ io.on('connection', (socket) => {
 
   socket.on('pass', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      gameLogic.handlePass(room, data.playerId);
+      const { room, playerId } = authorize(socket, data.roomId);
+      gameLogic.handlePass(room, playerId);
       startTurnTimer(room.id);
-      io.to(room.id).emit('gameUpdated', serializeRoom(room));
-      // 触发 AI 行动
+      broadcastGameState(room);
       handleAIAction(room.id);
     } catch (error) {
       socket.emit('gameError', { message: error.message, code: error.code || 'GAME_ACTION_FAILED' });
     }
   });
 
-  // 设置组队模式
+  // 设置组队模式（房主）
   socket.on('setTeamMode', (data) => {
     try {
-      const room = roomManager.setTeamMode(data.roomId, data.mode, data.playerId);
-      io.to(room.id).emit('roomUpdated', serializeRoom(room));
+      const { room, playerId } = authorize(socket, data.roomId);
+      const updated = roomManager.setTeamMode(room.id, data.mode, playerId);
+      broadcastRoomState(updated);
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'SET_TEAM_MODE_FAILED' });
     }
   });
 
-  // 分配玩家队伍
+  // 分配玩家队伍（房主）
   socket.on('assignPlayerTeam', (data) => {
     try {
-      const room = roomManager.assignPlayerTeam(
-        data.roomId,
+      const { room, playerId } = authorize(socket, data.roomId);
+      const updated = roomManager.assignPlayerTeam(
+        room.id,
         data.playerIndex,
         data.team,
-        data.playerId
+        playerId
       );
-      io.to(room.id).emit('roomUpdated', serializeRoom(room));
+      broadcastRoomState(updated);
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'ASSIGN_TEAM_FAILED' });
     }
   });
 
   socket.on('sendMessage', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
+      const { room, player } = authorize(socket, data.roomId);
+      const text = typeof data.text === 'string' ? data.text.slice(0, 200) : '';
 
-      io.to(room.id).emit('messageReceived', data);
+      // 发送者身份由服务端裁定，避免冒充他人发言
+      io.to(room.id).emit('messageReceived', {
+        playerId: player.id,
+        playerName: player.name,
+        avatar: player.avatar,
+        text,
+        timestamp: Date.now()
+      });
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'SEND_MESSAGE_FAILED' });
     }
   });
 
   // 玩家准备
   socket.on('playerReady', (data) => {
     try {
-      const room = roomManager.getRoom(data.roomId);
-      if (!room) throw new Error('房间不存在');
-
-      const result = gameLogic.handlePlayerReady(room, data.playerId);
+      const { room, playerId } = authorize(socket, data.roomId);
+      const result = gameLogic.handlePlayerReady(room, playerId);
       syncRoomState(room);
 
       if (result.shouldStart) {
         startPreparedRound(room.id);
       }
     } catch (error) {
-      socket.emit('error', { message: error.message });
+      socket.emit('error', { message: error.message, code: error.code || 'READY_FAILED' });
     }
   });
 
@@ -618,9 +657,11 @@ io.on('connection', (socket) => {
     console.log('用户断开:', socket.id);
     const disconnectResult = roomManager.handleDisconnect(socket.id);
     if (disconnectResult?.room) {
-      io.to(disconnectResult.roomId).emit('roomUpdated', serializeRoom(disconnectResult.room));
+      broadcastRoomState(disconnectResult.room);
       if (disconnectResult.room.gameState === 'playing') {
-        io.to(disconnectResult.roomId).emit('gameUpdated', serializeRoom(disconnectResult.room));
+        broadcastGameState(disconnectResult.room);
+        // 断线者若正好是当前行动者，必须交给托管推进，否则牌局会停在这一步
+        handleAIAction(disconnectResult.roomId);
       }
     }
     broadcastRoomList();

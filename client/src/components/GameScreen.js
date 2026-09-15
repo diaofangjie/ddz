@@ -1554,10 +1554,14 @@ function GameScreen({ room, player, messages, gameHint, gameResult, roundResult,
     const ranks = ['3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A', '2', 'small', 'big'];
 
     // 根据玩家数量确定牌数（4人两副，3人一副）
-    const deckCount = room.players.length === 4 ? 2 : 1;
+    const isFourPlayer = room.players.length === 4;
+    const deckCount = isFourPlayer ? 2 : 1;
     ranks.forEach(r => {
       counts[r] = (r === 'small' || r === 'big') ? deckCount : 4 * deckCount;
     });
+
+    // 4 人自定义变体：双副牌剔除全部 3，记牌器不应残留 8 张"幽灵 3"
+    if (isFourPlayer) counts['3'] = 0;
 
     // 减去自己手上的牌
     myHand.forEach(card => {
@@ -1569,15 +1573,19 @@ function GameScreen({ room, player, messages, gameHint, gameResult, roundResult,
       counts[card.rank] = (counts[card.rank] || 0) - 1;
     });
 
-    // 减去底牌
-    if (room.game.dipai && room.game.phase === 'playing') {
+    // 减去底牌：仅对"非地主"生效。
+    // 地主的手牌里已经含底牌（叫地主时已并入），若再减一次会导致地主视角
+    // 这 3 个点数被重复扣减、显示负数。
+    const landlordIndex = room.game.landlord;
+    const iAmLandlord = landlordIndex !== null && landlordIndex !== undefined && landlordIndex === playerIndex;
+    if (room.game.dipai && room.game.dipai.length > 0 && !iAmLandlord) {
       room.game.dipai.forEach(card => {
         counts[card.rank] = (counts[card.rank] || 0) - 1;
       });
     }
 
     return counts;
-  }, [room.game, myHand, room.players.length]);
+  }, [room.game, myHand, room.players.length, playerIndex]);
 
   // 计算剩余牌总数
   const remainingTotal = useMemo(() => {
@@ -1824,7 +1832,9 @@ function GameScreen({ room, player, messages, gameHint, gameResult, roundResult,
   // 渲染记牌器
   const renderCardCounter = () => {
     // 欢乐斗地主顺序：大王、小王、2、A、K、Q、J、10、9、8、7、6、5、4、3
-    const ranks = ['big', 'small', '2', 'A', 'K', 'Q', 'J', '10', '9', '8', '7', '6', '5', '4', '3'];
+    const allRanks = ['big', 'small', '2', 'A', 'K', 'Q', 'J', '10', '9', '8', '7', '6', '5', '4', '3'];
+    // 4 人自定义变体不含 3，直接从记牌器里移除该档位
+    const ranks = room.players.length === 4 ? allRanks.filter(r => r !== '3') : allRanks;
 
     const getRankDisplay = (rank) => {
       if (rank === 'big') return '大王';

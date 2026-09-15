@@ -10,6 +10,36 @@ class RoomManager {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
   }
 
+  /**
+   * 绑定 socket 与玩家身份。
+   * 同一玩家只保留最新 socket：刷新页面/重连后旧连接若未及时断开，
+   * 会留下"僵尸身份"造成身份歧义，这里主动清理。
+   */
+  bindSocket(socketId, playerId) {
+    if (!socketId || !playerId) return;
+    for (const [sid, pid] of this.socketPlayerMap.entries()) {
+      if (pid === playerId && sid !== socketId) {
+        this.socketPlayerMap.delete(sid);
+      }
+    }
+    this.socketPlayerMap.set(socketId, playerId);
+  }
+
+  /** 由 socket 反查玩家身份。动作类事件一律以此为准，不采信客户端自报。 */
+  getPlayerIdBySocket(socketId) {
+    if (!socketId) return null;
+    return this.socketPlayerMap.get(socketId) || null;
+  }
+
+  /** 该玩家当前所有的 socket 连接 */
+  getSocketIdsByPlayer(playerId) {
+    const result = [];
+    for (const [sid, pid] of this.socketPlayerMap.entries()) {
+      if (pid === playerId) result.push(sid);
+    }
+    return result;
+  }
+
   createAIPlayer(index) {
     const aiNames = ['Alice', 'Bob', 'Charlie', 'David'];
     return {
@@ -60,9 +90,7 @@ class RoomManager {
 
     this.rooms.set(roomId, room);
     this.playerRoomMap.set(data.player.id, roomId);
-    if (socketId) {
-      this.socketPlayerMap.set(socketId, data.player.id);
-    }
+    this.bindSocket(socketId, data.player.id);
     return room;
   }
 
@@ -72,15 +100,12 @@ class RoomManager {
 
     const maxPlayers = room.settings.mode === '4player' ? 4 : 3;
 
-    // 优先通过 player.id 查找（最准确）
-    let existingPlayer = room.players.find(p => p.id === player.id);
-
-    // 如果没找到，再通过名字查找离线玩家（允许用相同名字重连）
-    if (!existingPlayer) {
-      existingPlayer = room.players.find(p =>
-        p.name === player.name && !p.isAI // 只匹配同名的非AI玩家
-      );
-    }
+    // 只按 player.id 匹配。
+    // 安全说明：此前的"同名即可重连"分支允许任何人输入他人昵称顶替其座位、
+    // 接管其手牌，属于身份伪造漏洞，已移除。
+    // 正常重连由客户端 localStorage 中持久化的 playerId 完成（同设备刷新即可）；
+    // 换设备/清缓存后需由房主重新开局，或等待后续引入服务端签发的 reconnectKey。
+    const existingPlayer = room.players.find(p => p.id === player.id);
 
     if (existingPlayer) {
       // 这是断线重连，重新激活玩家
@@ -95,9 +120,7 @@ class RoomManager {
       // 更新地图
       this.playerRoomMap.delete(oldId);
       this.playerRoomMap.set(player.id, roomId);
-      if (socketId) {
-        this.socketPlayerMap.set(socketId, player.id);
-      }
+      this.bindSocket(socketId, player.id);
       // 玩家上线，更新 emptySince
       this.updateEmptySince(room);
       return room;
@@ -110,9 +133,7 @@ class RoomManager {
     player.isOffline = false;
     room.players.push(player);
     this.playerRoomMap.set(player.id, roomId);
-    if (socketId) {
-      this.socketPlayerMap.set(socketId, player.id);
-    }
+    this.bindSocket(socketId, player.id);
     // 新玩家加入，更新 emptySince
     this.updateEmptySince(room);
     return room;
