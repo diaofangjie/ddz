@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>斗地主项目开发文档 · 导航</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --ink:#1a1d21; --ink-2:#4a5158; --ink-3:#7a828b;
+    --line:#e3e6ea; --line-2:#eef0f3;
+    --red:#d92d20; --red-bg:#fef3f2; --amber:#b54708; --amber-bg:#fffaeb;
+    --green:#067647; --green-bg:#ecfdf3; --blue:#175cd3; --blue-bg:#eff8ff;
+    --violet:#6941c6; --violet-bg:#f9f5ff;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px}
+  header.top{margin-bottom:32px}
+  .eyebrow{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:8px}
+  h1{font-size:30px;line-height:1.25;margin:0 0 10px;letter-spacing:-.01em}
+  .lede{color:var(--ink-2);max-width:760px;margin:0}
+  .meta{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-size:12.5px;color:var(--ink-2)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dot.ok{background:#12b76a}.dot.bad{background:#f04438}.dot.warn{background:#f79009}
+
+  h2{font-size:18px;margin:38px 0 14px;letter-spacing:-.005em}
+  h2 .hint{font-weight:400;font-size:13px;color:var(--ink-3);margin-left:8px}
+
+  .grid{display:grid;gap:12px}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px}
+  .card h3{margin:0 0 6px;font-size:15px}
+  .card p{margin:0;font-size:13.5px;color:var(--ink-2)}
+  .card .num{font-size:11.5px;font-weight:700;color:var(--violet);letter-spacing:.06em}
+  a.card{display:block;text-decoration:none;color:inherit;transition:border-color .15s,box-shadow .15s,transform .15s}
+  a.card:hover{border-color:#c9cfd6;box-shadow:0 2px 10px rgba(16,24,40,.06);transform:translateY(-1px)}
+
+  .stat{display:flex;flex-direction:column;gap:2px}
+  .stat .v{font-size:22px;font-weight:650;letter-spacing:-.02em}
+  .stat .k{font-size:12.5px;color:var(--ink-3)}
+
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;font-size:13.5px}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line-2);vertical-align:top}
+  th{background:#fafbfc;font-weight:600;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  .tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11.5px;font-weight:600;white-space:nowrap}
+  .t-p0{background:var(--red-bg);color:var(--red)}
+  .t-p1{background:var(--amber-bg);color:var(--amber)}
+  .t-p2{background:var(--blue-bg);color:var(--blue)}
+  .t-ok{background:var(--green-bg);color:var(--green)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;background:#f1f3f5;padding:1px 5px;border-radius:5px;color:#2c3138}
+
+  .flow{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+
+  .road{display:flex;flex-direction:column;gap:0}
+  .step{display:grid;grid-template-columns:64px 1fr;gap:14px;position:relative;padding-bottom:18px}
+  .step:last-child{padding-bottom:0}
+  .step::before{content:"";position:absolute;left:31px;top:26px;bottom:0;width:1px;background:var(--line)}
+  .step:last-child::before{display:none}
+  .badge{width:46px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:var(--violet-bg);color:var(--violet);border:1px solid #e4d9fb;z-index:1}
+  .step .body h4{margin:2px 0 4px;font-size:14.5px}
+  .step .body p{margin:0;font-size:13.5px;color:var(--ink-2)}
+  .step .body .out{margin-top:6px;font-size:12.5px;color:var(--ink-3)}
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="eyebrow">DDZ · 开发文档</div>
+    <h1>斗地主项目开发文档 · 导航</h1>
+    <p class="lede">
+      目标：在不推倒重来的前提下，把当前"功能跑得动、地基没打好"的系统，改造成敢改、能扩、可测、防作弊的样子。
+      本页是文档体系的入口，也是项目现状与计划的一页速览。
+    </p>
+    <div class="meta">
+      <span class="chip"><span class="dot ok"></span>线上服务正常 · 8.137.195.155</span>
+      <span class="chip"><span class="dot bad"></span>无版本控制</span>
+      <span class="chip"><span class="dot bad"></span>手牌全量广播</span>
+      <span class="chip"><span class="dot warn"></span>443 未开放（无 HTTPS）</span>
+      <span class="chip">审计时间 2026-09-15</span>
+    </div>
+  </header>
+
+  <h2>一页速览</h2>
+  <div class="grid g4 g3">
+    <div class="card stat"><span class="v">1881</span><span class="k">后端代码行数（4 个文件）</span></div>
+    <div class="card stat"><span class="v">81.8 KB</span><span class="k">GameScreen.js 单文件体积</span></div>
+    <div class="card stat"><span class="v">6 / 8</span><span class="k">P0 / P1 风险项</span></div>
+    <div class="card stat"><span class="v">0</span><span class="k">自动化测试用例</span></div>
+  </div>
+
+  <h2>文档地图 <span class="hint">按顺序阅读</span></h2>
+  <div class="grid g3">
+    <a class="card" href="./00-现状审计与风险清单.md"><span class="num">00</span><h3>现状审计与风险清单</h3><p>真实体检报告：线上实测结果、代码规模、6 项 P0 与 8 项 P1 风险，全部带文件行号证据。</p></a>
+    <a class="card" href="./01-目标架构设计.md"><span class="num">01</span><h3>目标架构设计</h3><p>模块划分、视图裁剪、统一广播、统一调度器、座位模型、持久化与部署拓扑。</p></a>
+    <a class="card" href="./02-通信协议规范.md"><span class="num">02</span><h3>通信协议规范</h3><p>Socket.IO 事件表（现状 + 目标）、错误码、身份握手、8 条协议回归断言。</p></a>
+    <a class="card" href="./03-游戏规则与状态机.md"><span class="num">03</span><h3>游戏规则与状态机</h3><p>3/4 人玩法差异、牌型枚举、阶段状态机、计分公式、8 条实现偏差与 8 个待确认问题。</p></a>
+    <a class="card" href="./04-部署与运维手册.md"><span class="num">04</span><h3>部署与运维手册</h3><p>阿里云实测、目标拓扑、Nginx + HTTPS 配置、发布回滚、备份与排障速查表。</p></a>
+    <a class="card" href="./05-测试与质量保障.md"><span class="num">05</span><h3>测试与质量保障</h3><p>测试分层、70+ 条单元用例清单、协议断言、质量门禁与手工验收清单。</p></a>
+    <a class="card" href="./06-迭代路线图.md"><span class="num">06</span><h3>迭代路线图</h3><p>阶段 0-4 的目标、交付物、验收标准与立即可执行的下一步命令。</p></a>
+    <a class="card" href="./CHANGELOG.md"><span class="num">—</span><h3>变更日志</h3><p>Keep a Changelog 格式，从 v1.0.0-baseline 基线开始记录。</p></a>
+    <a class="card" href="./adr/README.md"><span class="num">ADR</span><h3>架构决策记录</h3><p>已采纳 3 条：不重写、服务端权威、身份由服务端签发。含模板与写法规范。</p></a>
+    <a class="card" href="./README.md"><span class="num">—</span><h3>文档维护规约</h3><p>文档地图、五条维护铁律、迭代流程与命名约定 —— 这套文档不腐烂的原因。</p></a>
+  </div>
+
+  <h2>目标架构 <span class="hint">服务端权威 + 按观察者裁剪</span></h2>
+  <div class="flow">
+    <svg viewBox="0 0 1000 470" role="img" aria-label="目标架构图">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,1 L9,5 L0,9 z" fill="#98a2b3"/>
+        </marker>
+        <style>
+          .bx{fill:#ffffff;stroke:#d9dee4;stroke-width:1.4;rx:10}
+          .bx-ok{fill:#f0fdf4;stroke:#a6e0bd;stroke-width:1.4}
+          .bx-warn{fill:#fffaeb;stroke:#f5d18a;stroke-width:1.4}
+          .bx-key{fill:#f9f5ff;stroke:#d6c5f7;stroke-width:1.6}
+          .t{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;fill:#1a1d21;font-size:14px}
+          .ts{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;fill:#7a828b;font-size:11.5px}
+          .tm{font-family:ui-monospace,Consolas,monospace;fill:#4a5158;font-size:11px}
+          .lb{font-family:-apple-system,"PingFang SC",sans-serif;fill:#98a2b3;font-size:11px}
+          .ln{stroke:#98a2b3;stroke-width:1.4;fill:none;marker-end:url(#ar)}
+        </style>
+      </defs>
+
+      <!-- clients -->
+      <rect class="bx" x="20" y="30" width="150" height="52"/>
+      <text class="t" x="95" y="52" text-anchor="middle">玩家 A（座位）</text>
+      <text class="ts" x="95" y="69" text-anchor="middle">只看得到自己手牌</text>
+
+      <rect class="bx" x="20" y="100" width="150" height="52"/>
+      <text class="t" x="95" y="122" text-anchor="middle">玩家 B / C / D</text>
+      <text class="ts" x="95" y="139" text-anchor="middle">只看得到张数</text>
+
+      <rect class="bx" x="20" y="170" width="150" height="52"/>
+      <text class="t" x="95" y="192" text-anchor="middle">观战者 E…J</text>
+      <text class="ts" x="95" y="209" text-anchor="middle">全程无牌面</text>
+
+      <!-- nginx -->
+      <rect class="bx-warn" x="250" y="70" width="176" height="112"/>
+      <text class="t" x="338" y="98" text-anchor="middle" font-weight="600">Nginx · :443 TLS</text>
+      <text class="ts" x="338" y="120" text-anchor="middle">/ → 静态站点 build/</text>
+      <text class="ts" x="338" y="138" text-anchor="middle">/socket.io/ → 127.0.0.1:3001</text>
+      <text class="ts" x="338" y="156" text-anchor="middle">:80 → 301 → https</text>
+      <text class="ts" x="338" y="174" text-anchor="middle">终止 TLS、同域相对路径</text>
+
+      <!-- node -->
+      <rect class="bx" x="506" y="24" width="200" height="204"/>
+      <text class="t" x="606" y="50" text-anchor="middle" font-weight="600">Node · pm2 单实例</text>
+      <text class="ts" x="606" y="68" text-anchor="middle">仅监听 127.0.0.1:3001</text>
+
+      <rect class="bx-key" x="524" y="82" width="164" height="34"/>
+      <text class="t" x="606" y="104" text-anchor="middle" font-size="12.5">net/gateway 身份绑定</text>
+
+      <rect class="bx-key" x="524" y="124" width="164" height="34"/>
+      <text class="t" x="606" y="146" text-anchor="middle" font-size="12.5">projector 视图裁剪</text>
+
+      <rect class="bx" x="524" y="166" width="164" height="48"/>
+      <text class="t" x="606" y="186" text-anchor="middle" font-size="12.5">room/scheduler</text>
+      <text class="ts" x="606" y="203" text-anchor="middle">超时 · 托管 · AI 唯一入口</text>
+
+      <!-- domain -->
+      <rect class="bx-ok" x="506" y="266" width="200" height="150"/>
+      <text class="t" x="606" y="292" text-anchor="middle" font-weight="600">domain · 纯函数</text>
+      <text class="ts" x="606" y="310" text-anchor="middle">无 IO / 无定时器 / 可单测</text>
+      <text class="tm" x="524" y="338">cards.js</text>
+      <text class="ts" x="700" y="338" text-anchor="end">牌型判定</text>
+      <text class="tm" x="524" y="362">machine.js</text>
+      <text class="ts" x="700" y="362" text-anchor="end">阶段状态机</text>
+      <text class="tm" x="524" y="386">rules3 / rules4</text>
+      <text class="ts" x="700" y="386" text-anchor="end">玩法参数</text>
+      <text class="tm" x="524" y="408">scoring.js</text>
+      <text class="ts" x="700" y="408" text-anchor="end">计分（守恒）</text>
+
+      <!-- store -->
+      <rect class="bx" x="790" y="266" width="186" height="150"/>
+      <text class="t" x="883" y="292" text-anchor="middle" font-weight="600">store</text>
+      <text class="ts" x="883" y="310" text-anchor="middle">持久化与恢复</text>
+      <text class="tm" x="808" y="340">data/snapshot.json</text>
+      <text class="ts" x="883" y="360" text-anchor="middle">进行中房间快照</text>
+      <text class="tm" x="808" y="386">data/ddz.sqlite</text>
+      <text class="ts" x="883" y="406" text-anchor="middle">对局历史 / 战绩</text>
+
+      <!-- arrows -->
+      <path class="ln" d="M170 56 L246 104"/>
+      <path class="ln" d="M170 126 L246 126"/>
+      <path class="ln" d="M170 196 L246 150"/>
+      <path class="ln" d="M426 126 L502 126"/>
+      <path class="ln" d="M606 228 L606 262"/>
+      <path class="ln" d="M706 341 L786 341"/>
+      <text class="lb" x="440" y="96">同域 https / wss</text>
+      <text class="lb" x="628" y="250">调用规则</text>
+      <text class="lb" x="728" y="334">读写</text>
+
+      <text class="lb" x="20" y="248">客户端只发送"意图"，永不参与判定</text>
+      <text class="lb" x="20" y="266">状态变更由服务端裁定后逐人投影下发</text>
+      <text class="lb" x="506" y="446">牌局状态从不离开服务端进程 —— 这是防作弊的根本</text>
+    </svg>
+  </div>
+
+  <h2>风险清单 <span class="hint">完整版见 00 文档</span></h2>
+  <table>
+    <thead><tr><th>级别</th><th>风险</th><th>证据</th><th>处理阶段</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag t-p0">P0-1</span></td><td>项目无版本控制，重构不可回滚</td><td><code>ddz/.git</code> 不存在</td><td>阶段 0</td></tr>
+      <tr><td><span class="tag t-p0">P0-2</span></td><td>手牌全量广播，抓包即可看穿牌局</td><td><code>index.js:119-143</code> 序列化含 <code>game.hands</code></td><td>阶段 0</td></tr>
+      <tr><td><span class="tag t-p0">P0-3</span></td><td>客户端自报 <code>playerId</code>，可替他人出牌</td><td><code>index.js:491/505/519/534/554</code></td><td>阶段 0</td></tr>
+      <tr><td><span class="tag t-p0">P0-4</span></td><td>昵称即身份，可抢注顶替</td><td><code>RoomManager.js:81</code> 按 <code>name</code> 匹配</td><td>阶段 0</td></tr>
+      <tr><td><span class="tag t-p0">P0-5</span></td><td>无 HTTPS，443 未开放</td><td>端口探测：443 关闭</td><td>阶段 3</td></tr>
+      <tr><td><span class="tag t-p0">P0-6</span></td><td>状态全内存，重启即掉局</td><td>无持久化层</td><td>阶段 3</td></tr>
+      <tr><td><span class="tag t-p1">P1-1</span></td><td>两条广播路径，<code>Set</code> 变 <code>{}</code></td><td>16 处裸 <code>emit(currentRoom)</code></td><td>阶段 2</td></tr>
+      <tr><td><span class="tag t-p1">P1-2</span></td><td><code>voteExtend</code> 服务端未实现</td><td><code>App.js:290</code> 发出，无 handler</td><td>阶段 4</td></tr>
+      <tr><td><span class="tag t-p1">P1-3</span></td><td>超时/托管/AI 三段逻辑重复</td><td><code>index.js:50/241/322</code></td><td>阶段 2</td></tr>
+      <tr><td><span class="tag t-p1">P1-8</span></td><td>硬编码 IP + 僵尸 <code>.env</code></td><td><code>config.js:10</code></td><td>阶段 3</td></tr>
+    </tbody>
+  </table>
+
+  <h2>迭代路线图 <span class="hint">止血 → 安全 → 可测 → 重构 → 扩容 → 体验</span></h2>
+  <div class="road">
+    <div class="step">
+      <div class="badge">0</div>
+      <div class="body">
+        <h4>止血 · 让项目可回滚、不可作弊</h4>
+        <p>建立 git 与基线 tag、物理备份、身份由服务端签发、视图裁剪初版、补阶段校验。同时处理云服务器到期风险（备份 + 设置提醒）。</p>
+        <div class="out">验收：<code>git log</code> 有 baseline；篡改身份的脚本失效</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="badge">1</div>
+      <div class="body">
+        <h4>可测试化 · 建立安全网</h4>
+        <p>引入 Vitest，抽出 <code>domain/</code> 纯函数层（行为零变化），补齐牌型、比较、计分、发牌、状态机共 70+ 条用例。</p>
+        <div class="out">门槛：<code>domain/</code> ≥ 200 用例全绿，行覆盖 ≥ 90%</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="badge">2</div>
+      <div class="body">
+        <h4>架构重构 · 绞杀者模式</h4>
+        <p>统一广播出口、统一调度器、状态机显式化、座位模型、拆分 <code>index.js</code> 与 <code>GameScreen.js</code>。每个子任务单独提交、单独可回滚。</p>
+        <div class="out">验收：测试全绿；<code>index.js</code> &lt; 100 行；无重复阶段分支</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="badge">3</div>
+      <div class="body">
+        <h4>在线能力 · 用户的核心诉求</h4>
+        <p>HTTPS + 域名、同域相对路径、座位 + 观战席（总容量 10）、观战与轮换、SQLite 持久化、重连强化、安全加固。并决定试用到期后的主机方案。</p>
+        <div class="out">验收：微信内可打开；满员后进观战席且看不到任何手牌；重启后房间可恢复</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="badge">4</div>
+      <div class="body">
+        <h4>体验与运营</h4>
+        <p>战绩体系、复盘回放、房间管理后台、音效动效、观战增强、<code>voteExtend</code> 需求池补齐。</p>
+        <div class="out">持续性工作，按需排期</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>现在就能执行的第一步</h2>
+  <div class="flow">
+    <svg viewBox="0 0 1000 92" role="img" aria-label="止血步骤">
+      <defs><style>
+        .sm{font-family:ui-monospace,Consolas,monospace;fill:#2c3138;font-size:12px}
+        .st{font-family:-apple-system,"PingFang SC",sans-serif;fill:#1a1d21;font-size:13px;font-weight:600}
+      </style></defs>
+      <rect class="bx" x="0" y="8" width="228" height="72" rx="10" fill="#ffffff" stroke="#d9dee4"/>
+      <text class="st" x="16" y="32">1 · 建立版本控制</text>
+      <text class="sm" x="16" y="52">git init</text>
+      <text class="sm" x="16" y="70">git commit -m "baseline"</text>
+
+      <rect class="bx" x="248" y="8" width="228" height="72" rx="10" fill="#ffffff" stroke="#d9dee4"/>
+      <text class="st" x="264" y="32">2 · 物理备份</text>
+      <text class="sm" x="264" y="52">Compress-Archive 全量打包</text>
+      <text class="sm" x="264" y="70">存到本机 D:\dfj\ddz-baseline</text>
+
+      <rect class="bx" x="496" y="8" width="240" height="72" rx="10" fill="#ffffff" stroke="#d9dee4"/>
+      <text class="st" x="512" y="32">3 · 与线上对齐</text>
+      <text class="sm" x="512" y="52">scp -r root@8.137.195.155:/srv/ddz</text>
+      <text class="sm" x="512" y="70">确认本地 = 线上版本</text>
+
+      <rect class="bx" x="756" y="8" width="244" height="72" rx="10" fill="#fffaeb" stroke="#f5d18a"/>
+      <text class="st" x="772" y="32">4 · 摸清服务器环境</text>
+      <text class="sm" x="772" y="52">os-release / nproc / free / df</text>
+      <text class="sm" x="772" y="70">node -v / pm2 list / nginx -v</text>
+    </svg>
+  </div>
+
+  <footer>
+    斗地主项目开发文档 · 生成于 2026-09-15 · 源码基线 <code>v1.0.0-baseline</code><br>
+    修改文档请遵循 <a href="./README.md">文档维护规约</a>：代码与文档同一次提交，每次合并必写变更日志，不可逆决策写 ADR。
+  </footer>
+
+</div>
+</body>
+</html>

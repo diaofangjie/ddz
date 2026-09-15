@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build outputs
+client/build/
+client/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+server/logs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Capacitor
+client/android/
+client/ios/
+
+# Testing
+coverage/
+
+# Release archives（部署包由发布流程生成，不入库）
+*.zip
+client/build.zip
+ddz-alibaba-deploy.zip
+
+# Vercel
+.vercel/
+
+# 临时/RM 产物
+repomix-output.xml
+*.tmp
+*.bak
+
+# 运行时数据（阶段 3 引入持久化后启用）
+data/*.json
+data/*.sqlite
+!data/.gitkeep

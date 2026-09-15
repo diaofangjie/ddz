@@ -1,0 +1,16 @@
+{
+  "name": "ddz-game",
+  "version": "1.0.0",
+  "description": "斗地主 - 好友开房间",
+  "private": true,
+  "scripts": {
+    "dev": "cd server && node src/index.js & cd client && npm start",
+    "build": "cd client && npm run build",
+    "install:all": "cd server && npm install && cd ../client && npm install",
+    "start:server": "cd server && node src/index.js",
+    "start:client": "cd client && npm start"
+  },
+  "keywords": ["dou dizhu", "game", "card game"],
+  "author": "DDZ Team",
+  "license": "MIT"
+}
