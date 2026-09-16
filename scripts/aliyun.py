@@ -25,6 +25,16 @@ import time
 
 import paramiko
 
+# Windows 控制台/管道的默认编码是 GBK(cp936)，而远端命令输出里会出现 "✓"、"─"
+# 这类字符（pm2 的表格尤甚）。直接 print 会抛 UnicodeEncodeError，
+# 把部署流程从中间打断 —— 最坏情况是"文件已覆盖但没重启、也没做健康检查"。
+# 统一把标准输出切成 UTF-8，无法编码的字符降级替换而不是抛异常。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HOST = "8.137.195.155"
 PORT = 22
 USER = "root"
