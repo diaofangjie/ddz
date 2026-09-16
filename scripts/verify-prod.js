@@ -19,9 +19,10 @@ function check(name, pass, detail) {
 
 function makeClient(name) {
   const socket = io(BASE, { transports: ['websocket'], reconnection: false, timeout: 8000 });
-  const c = { name, socket, events: {}, errors: [], roomId: null, you: null, hands: null, players: null, dipai: null };
+  const c = { name, socket, events: {}, errors: [], roomId: null, you: null, hands: null, players: null, dipai: null, hostId: null, roomList: null };
   socket.onAny((ev, payload) => {
     if (ev === 'error') c.errors.push(payload);
+    if (ev === 'roomListUpdated') c.roomList = payload;
     c.events[ev] = payload;
     if ((ev === 'roomCreated' || ev === 'joinedRoom') && payload) {
       c.roomId = payload.id;
@@ -33,6 +34,7 @@ function makeClient(name) {
       c.dipai = g.dipai;
     }
     if (payload && Array.isArray(payload.players)) c.players = payload.players;
+    if (payload && typeof payload.hostId === 'string') c.hostId = payload.hostId;
   });
   return c;
 }
@@ -168,6 +170,92 @@ function seatIndex(c) {
     A2.you && A2.you.id === victimId,
     `重连后 id=${A2.you ? A2.you.id : '无'}，期望=${victimId}`);
 
+  // ---- 验收 7：4 人房人力/开局/退出再进/空房回收（本轮修复） ----
+  console.log('\n[8] 4 人房：满员开局 / 退出再进 / 空房回收');
+  const P = ['P1', 'P2', 'P3', 'P4'].map((n) => makeClient(n));
+  P[0].socket.emit('createRoom', {
+    player: { id: null, name: '四人房主', avatar: 0 },
+    mode: '4player', rounds: 1, laiziMode: 'none', maxMultiplier: 64, isAI: false
+  });
+  await waitFor(() => P[0].roomId, 6000, '4 人房建房');
+  const roomId4 = P[0].roomId;
+
+  for (let i = 1; i < 4; i++) {
+    P[i].socket.emit('joinRoom', {
+      roomId: roomId4,
+      player: { id: null, name: `四人P${i + 1}`, avatar: i }
+    });
+  }
+  await waitFor(() => P.every((c) => c.players && c.players.length === 4), 8000, '四人入房');
+
+  check('4 名真人全部入座，人数正好是 4',
+    P.every((c) => c.players.length === 4),
+    `players=${P[0].players.length}`);
+  check('房间里没有任何离线空壳座位',
+    P[0].players.every((p) => !p.isOffline),
+    P[0].players.map((p) => `${p.name}${p.isOffline ? '(离线)' : ''}`).join(','));
+  check('房主身份绑定在建房者身上（不再靠 players[0]）',
+    P[0].hostId === P[0].you.id,
+    `hostId=${P[0].hostId} 建房者=${P[0].you.id}`);
+
+  // 房主长按拖动交换队伍（服务端部分）
+  P[0].socket.emit('setTeamMode', { roomId: roomId4, mode: 'assigned' });
+  await sleep(500);
+  const teamsBefore = (P[0].events.roomUpdated || {}).settings.playerTeams || {};
+  P[0].socket.emit('swapPlayerTeams', { roomId: roomId4, indexA: 0, indexB: 1 });
+  await sleep(500);
+  const teamsAfter = (P[0].events.roomUpdated || {}).settings.playerTeams || {};
+  const reds4 = [0, 1, 2, 3].filter((i) => teamsAfter[i] === 'red').length;
+  check('交换队伍后两人归属对调、仍是红蓝各 2 人',
+    teamsAfter[0] === teamsBefore[1] && teamsAfter[1] === teamsBefore[0] && reds4 === 2,
+    `${JSON.stringify(teamsBefore)} -> ${JSON.stringify(teamsAfter)}`);
+
+  // 退出再进：绝不能出现"在线 + 离线"的幽灵副本
+  P[3].socket.emit('leaveRoom', { roomId: roomId4, playerId: P[3].you.id });
+  await waitFor(() => P[0].players && P[0].players.length === 3, 6000, 'P4 退出');
+  check('主动退出后座位被摘除（不是只置离线）',
+    P[0].players.length === 3 && P[0].players.every((p) => !p.isOffline),
+    `players=${P[0].players.length}`);
+
+  const P4b = makeClient('P4b');
+  P4b.socket.emit('joinRoom', {
+    roomId: roomId4,
+    player: { id: null, name: '四人P4', avatar: 3 }
+    // 故意不带 sessionToken：模拟换标签页/清缓存后重新进入
+  });
+  await waitFor(() => P[0].players && P[0].players.length === 4, 6000, 'P4 再进');
+  await sleep(400);
+  const names4 = P[0].players.map((p) => p.name);
+  check('退出再进后人数仍是 4（不是 5）', P[0].players.length === 4, `players=${P[0].players.length}`);
+  check('同一昵称只出现一次，没有幽灵副本',
+    names4.filter((n) => n === '四人P4').length === 1, names4.join(','));
+  check('不存在同时在线又离线的同一人',
+    P[0].players.every((p) => !p.isOffline), names4.join(','));
+
+  // 房主此刻必须点得亮"开始游戏"
+  // 注意：留在房里的只有 P1/P2/P3 和重新进房的 P4b，P4 的老连接已经退出房间
+  const active4 = [P[0], P[1], P[2], P4b];
+  P[0].socket.emit('startGame', { roomId: roomId4 });
+  await waitFor(() => active4.every((c) => c.hands), 10000, '4 人房开局');
+  await sleep(500);
+  const handSizes4 = P[0].hands ? P[0].hands.map((h) => h.length) : [];
+  check('房主可以正常开始游戏（4 人房开局成功）',
+    active4.every((c) => !!c.hands),
+    `hands=${handSizes4.join(',')}`);
+  check('4 人局每人 25 张牌', handSizes4.length === 4 && handSizes4.every((n) => n === 25),
+    handSizes4.join(','));
+
+  // 全员离开 → 房间必须从大厅消失
+  [...P, P4b].forEach((c) => c.socket.disconnect());
+  await sleep(1800);
+  const probe = makeClient('probe');
+  probe.socket.emit('getRoomList');
+  await waitFor(() => probe.roomList, 6000, '拉取房间列表');
+  const stillListed = (probe.roomList || []).some((r) => r.id === roomId4);
+  check('全员离线后房间从大厅列表中移除', !stillListed,
+    stillListed ? `仍在列表中: ${JSON.stringify((probe.roomList || []).find((r) => r.id === roomId4))}` : '已移除');
+  probe.socket.disconnect();
+
   // ---- 汇总 ----
   const failed = results.filter((r) => !r.pass);
   console.log('\n' + '='.repeat(56));
@@ -180,7 +268,7 @@ function seatIndex(c) {
   }
   console.log('='.repeat(56) + '\n');
 
-  [A, B, C, D, A2].forEach((c) => { try { c.socket.disconnect(); } catch (e) {} });
+  [A, B, C, D, A2, ...P, P4b, probe].forEach((c) => { try { c.socket.disconnect(); } catch (e) {} });
   process.exit(failed.length ? 1 : 0);
 })().catch((e) => {
   console.error('\n验收脚本异常:', e.message);

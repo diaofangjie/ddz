@@ -19,6 +19,7 @@ import json
 import os
 import posixpath
 import re
+import subprocess
 import sys
 import time
 
@@ -34,6 +35,16 @@ LOCAL_INDEX = os.path.join(LOCAL_ROOT, "client", "build", "index.html")
 
 REMOTE_TGZ = "/tmp/ddz-release.tgz"
 PM2_NAME = "ddz-server"
+
+# 发布包里要带的东西（不含 node_modules：跨平台二进制不兼容，传上去也没用）
+PACKAGE_MEMBERS = [
+    "client/build",
+    "server/src",
+    "server/package.json",
+    "server/package-lock.json",
+]
+# Windows 自带 bsdtar；Linux 下退回 PATH 里的 tar
+TAR_EXE = r"C:\Windows\System32\tar.exe" if os.name == "nt" else "tar"
 
 DEFAULT_BACKEND = "/root/server"
 DEFAULT_WEB_ROOT = "/var/www/ddz"
@@ -110,6 +121,73 @@ def local_bundle():
         return None
 
 
+def newest_source_mtime():
+    """本地参与发布的文件里最新的一个修改时间"""
+    latest = 0.0
+    for member in PACKAGE_MEMBERS:
+        path = os.path.join(LOCAL_ROOT, *member.split("/"))
+        if os.path.isfile(path):
+            latest = max(latest, os.path.getmtime(path))
+        elif os.path.isdir(path):
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    latest = max(latest, os.path.getmtime(os.path.join(root, f)))
+    return latest
+
+
+def tar_members():
+    """列出当前发布包里的成员路径（正斜杠）"""
+    try:
+        r = subprocess.run([TAR_EXE, "-tzf", LOCAL_TGZ], cwd=LOCAL_ROOT,
+                           capture_output=True, text=True)
+    except OSError as e:
+        die(f"无法调用 {TAR_EXE}: {e}")
+    if r.returncode != 0:
+        return []
+    return [n.strip().lstrip("./").replace("\\", "/")
+            for n in r.stdout.splitlines() if n.strip()]
+
+
+def ensure_package():
+    """
+    确保发布包是**当前代码**打出来的。
+
+    踩过的坑：本脚本原先只负责上传已存在的 ddz-release.tgz，不负责打包。
+    改了代码却没重新打包，就会拿着上一次的旧包去覆盖线上 —— 服务器上跑的还是旧版本，
+    而"后端特征计数"这类校验因为旧版也含同样的函数名照样通过，只有 bundle 哈希对不上
+    才暴露出来。所以这里做两件事：过期就自动重打；打完再核对 bundle 真的在包里。
+    """
+    bundle = local_bundle()
+    if not bundle:
+        die("无法从本地 client/build/index.html 解析出 bundle 文件名（先执行构建）")
+
+    stale = True
+    if os.path.exists(LOCAL_TGZ):
+        age = os.path.getmtime(LOCAL_TGZ)
+        src = newest_source_mtime()
+        stale = age < src
+        if not stale:
+            ok("发布包是最新的，直接复用")
+        else:
+            log("发布包早于源码改动，重新打包")
+
+    if stale:
+        if not os.path.exists(TAR_EXE) and os.name == "nt":
+            die(f"找不到 {TAR_EXE}，无法打包")
+        r = subprocess.run([TAR_EXE, "-czf", os.path.basename(LOCAL_TGZ)] + PACKAGE_MEMBERS,
+                           cwd=LOCAL_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"打包失败: {(r.stderr or r.stdout).strip()}")
+        ok(f"已重新打包 {LOCAL_TGZ} ({os.path.getsize(LOCAL_TGZ) / 1024:.1f} KB)")
+
+    members = tar_members()
+    want = f"client/build/static/js/{bundle}"
+    if want not in members:
+        die(f"发布包里找不到 {want} —— 包与当前构建不一致，拒绝部署（请先重新构建并打包）")
+    ok(f"发布包内容与当前构建一致（{bundle}）")
+    return bundle
+
+
 def detect_paths(c):
     """探测后端目录与 nginx 前端根目录"""
     backend, web_root = DEFAULT_BACKEND, DEFAULT_WEB_ROOT
@@ -179,14 +257,11 @@ def cmd_deploy(c):
     log(f"后端目录  : {backend}")
     log(f"前端根目录: {web_root}")
 
-    if not os.path.exists(LOCAL_TGZ):
-        die(f"发布包不存在: {LOCAL_TGZ}")
+    # 打包 + 内容一致性核对，任一不满足直接中止，绝不拿旧包去覆盖线上
+    bundle = ensure_package()
     size = os.path.getsize(LOCAL_TGZ)
-    bundle = local_bundle()
     log(f"发布包    : {LOCAL_TGZ}  ({size / 1024:.1f} KB)")
     log(f"待发布 bundle: {bundle}")
-    if not bundle:
-        die("无法从本地 build/index.html 解析出 bundle 文件名")
 
     # ---- 1 ----
     log("1/8 前置检查")

@@ -92,6 +92,7 @@ function serializeRoom(room, viewerId) {
 
   return {
     id: room.id,
+    hostId: roomManager.getHostId(room),
     players: room.players ? room.players.map((p) => ({ ...p })) : [],
     settings: room.settings ? { ...room.settings } : {},
     currentRound: room.currentRound,
@@ -510,7 +511,7 @@ io.on('connection', (socket) => {
     try {
       const { room, playerId } = authorize(socket, data.roomId);
 
-      if (room.players[0]?.id !== playerId) {
+      if (roomManager.getHostId(room) !== playerId) {
         throw createError('只有房主可以开始游戏', 'NOT_HOST');
       }
       if (room.gameState === 'playing' && room.game) {
@@ -630,6 +631,22 @@ io.on('connection', (socket) => {
     }
   });
 
+  // 房主长按拖动：把两名玩家所在队伍互换（保 2v2，不会出现 3v1 被服务端重随）
+  socket.on('swapPlayerTeams', (data) => {
+    try {
+      const { room, playerId } = authorize(socket, data.roomId);
+      const updated = roomManager.swapPlayerTeams(
+        room.id,
+        data.indexA,
+        data.indexB,
+        playerId
+      );
+      broadcastRoomState(updated);
+    } catch (error) {
+      socket.emit('error', { message: error.message, code: error.code || 'SWAP_TEAM_FAILED' });
+    }
+  });
+
   socket.on('sendMessage', (data) => {
     try {
       const { room, player } = authorize(socket, data.roomId);
@@ -687,9 +704,6 @@ app.get('*', (req, res) => {
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);
-  // 启动房间自动清理定时器
-  roomManager.startCleanupInterval(
-    60 * 1000,   // 每 60 秒检查一次
-    5 * 60 * 1000 // 空闲 5 分钟的房间将被删除
-  );
+  // 启动房间自动清理定时器（主动退出即时解散，这里只兜住"断线后没回来"的宽限期）
+  roomManager.startCleanupInterval();
 });

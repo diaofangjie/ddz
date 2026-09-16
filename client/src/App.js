@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import io from 'socket.io-client';
 import HomeScreen from './components/HomeScreen';
 import RoomScreen from './components/RoomScreen';
@@ -23,32 +23,53 @@ function readSaved() {
   }
 }
 
+function writeSaved(info) {
+  try {
+    localStorage.setItem(CONN_KEY, JSON.stringify(info));
+    return true;
+  } catch (e) {
+    console.error('保存连接信息失败', e);
+    return false;
+  }
+}
+
 /**
  * 采纳服务端签发的身份。
  *
  * 服务端才是身份的权威来源：它会丢掉我们自报的 playerId，换成随机 id，
  * 并通过 `you` 字段告诉我们"你是谁"。重连凭证 sessionToken 只在
  * createRoom / joinRoom 的定向回包里出现一次，需要持久化保存。
+ *
+ * ⚠️ playerName / playerAvatar 必须一起落盘。
+ * joinRoom 就是靠 `saved.playerName === 当前名字 && saved.roomId === 房间号`
+ * 来决定要不要带上 sessionToken 的；这两个字段一直没被写过，条件恒为 false，
+ * 于是"退出再进"永远走不到重连分支，只会在服务端多推一条记录 ——
+ * 房间里同一个人就同时有了「在线」和「离线」两份，人数直接对不上。
  */
-function adoptYou(payload, setPlayer) {
+function adoptYou(payload, setPlayer, playerRef) {
   if (!payload || !payload.you || !payload.you.id) return;
 
   const serverId = payload.you.id;
   const saved = readSaved() || {};
+  const prev = playerRef.current;
+  const name = (prev && prev.name) || saved.playerName || '玩家';
+  const avatar = prev && prev.avatar !== undefined ? prev.avatar : (saved.playerAvatar || 0);
 
-  // 用函数式更新，避免 socket 回调闭包拿到过期的 player
-  setPlayer((prev) => {
-    if (prev && prev.id === serverId) return prev;
-    return {
-      id: serverId,
-      name: prev?.name || saved.playerName,
-      avatar: prev?.avatar ?? saved.playerAvatar ?? 0
-    };
-  });
+  if (!prev || prev.id !== serverId) {
+    const adopted = { id: serverId, name, avatar };
+    playerRef.current = adopted;
+    setPlayer(adopted);
+  }
 
-  const next = { ...saved, playerId: serverId, roomId: payload.id };
+  const next = {
+    ...saved,
+    playerId: serverId,
+    roomId: payload.id,
+    playerName: name,
+    playerAvatar: avatar
+  };
   if (payload.you.sessionToken) next.sessionToken = payload.you.sessionToken;
-  localStorage.setItem(CONN_KEY, JSON.stringify(next));
+  writeSaved(next);
 }
 
 function App() {
@@ -66,23 +87,27 @@ function App() {
   // 保存上次连接信息用于重连
   const [lastConnectionInfo, setLastConnectionInfo] = useState(null);
 
+  // socket 回调只注册一次，闭包拿不到最新 state；回调里要读的可变状态一律走 ref
+  const playerRef = useRef(null);
+  const roomRef = useRef(null);
+
+  useEffect(() => { playerRef.current = player; }, [player]);
+  useEffect(() => { roomRef.current = room; }, [room]);
+
   // 优先从本地存储恢复玩家信息
   useEffect(() => {
-    const savedInfo = localStorage.getItem('ddz_last_connection');
+    const savedInfo = readSaved();
     if (savedInfo) {
-      try {
-        const parsed = JSON.parse(savedInfo);
-        setLastConnectionInfo(parsed);
-        // 如果有保存的玩家信息，自动恢复
-        if (parsed.playerId && parsed.playerName) {
-          setPlayer({
-            id: parsed.playerId,
-            name: parsed.playerName,
-            avatar: parsed.playerAvatar || Math.floor(Math.random() * 8)
-          });
-        }
-      } catch (e) {
-        console.error('解析保存信息失败', e);
+      setLastConnectionInfo(savedInfo);
+      // 如果有保存的玩家信息，自动恢复
+      if (savedInfo.playerId && savedInfo.playerName) {
+        const restored = {
+          id: savedInfo.playerId,
+          name: savedInfo.playerName,
+          avatar: savedInfo.playerAvatar || 0
+        };
+        playerRef.current = restored;
+        setPlayer(restored);
       }
     }
   }, []);
@@ -99,6 +124,21 @@ function App() {
     newSocket.on('connect', () => {
       console.log('Socket 连接成功');
       setSocketConnected(true);
+
+      // 断线重连后主动认领回原座位。座位和房主身份都还在服务端留着，
+      // 不出示 token 的话服务端只会把我们当成新玩家，多出一条幽灵记录。
+      const saved = readSaved();
+      const currentRoom = roomRef.current;
+      if (saved && saved.sessionToken && saved.roomId
+        && currentRoom && currentRoom.id === saved.roomId) {
+        newSocket.emit('joinRoom', {
+          roomId: saved.roomId,
+          player: playerRef.current || { name: saved.playerName },
+          sessionToken: saved.sessionToken
+        });
+        return;
+      }
+
       newSocket.emit('getRoomList');
     });
 
@@ -115,7 +155,7 @@ function App() {
     newSocket.on('roomCreated', (r) => {
       setRoom(r);
       setScreen('room');
-      adoptYou(r, setPlayer);
+      adoptYou(r, setPlayer, playerRef);
     });
 
     newSocket.on('joinedRoom', (r) => {
@@ -126,12 +166,12 @@ function App() {
       } else {
         setScreen('room');
       }
-      adoptYou(r, setPlayer);
+      adoptYou(r, setPlayer, playerRef);
     });
 
     newSocket.on('roomUpdated', (r) => {
       setRoom({ ...r });
-      adoptYou(r, setPlayer);
+      adoptYou(r, setPlayer, playerRef);
       if (r.gameState === 'playing' && r.game) {
         setScreen('game');
       }
@@ -143,7 +183,7 @@ function App() {
 
     newSocket.on('gameStarted', (r) => {
       setRoom(r);
-      adoptYou(r, setPlayer);
+      adoptYou(r, setPlayer, playerRef);
       setRoundResult(null);
       setGameResult(null);
       setGameHint('');
@@ -152,14 +192,14 @@ function App() {
 
     newSocket.on('gameUpdated', (r) => {
       setRoom({ ...r });
-      adoptYou(r, setPlayer);
+      adoptYou(r, setPlayer, playerRef);
       setGameHint('');
     });
 
     newSocket.on('gameEnded', (result) => {
       if (result.room) {
         setRoom(result.room);
-        adoptYou(result.room, setPlayer);
+        adoptYou(result.room, setPlayer, playerRef);
       }
       setRoundResult(null);
       setGameResult(result);
@@ -169,7 +209,7 @@ function App() {
     newSocket.on('roundEnded', (result) => {
       if (result.room) {
         setRoom(result.room);
-        adoptYou(result.room, setPlayer);
+        adoptYou(result.room, setPlayer, playerRef);
       }
       setGameResult(null);
       setRoundResult(result);
@@ -194,17 +234,19 @@ function App() {
 
   const createPlayer = (name) => {
     const saved = readSaved();
+    const sameName = !!(saved && saved.playerName === name);
 
     // 注意：id 只是本地占位，服务端会丢掉它并签发权威 id（见 adoptYou）。
     // 因此这里用什么值都不影响安全，重连靠的是 sessionToken。
     const newPlayer = {
-      id: (saved && saved.playerName === name && saved.playerId)
-        ? saved.playerId
-        : `local_${Date.now()}`,
+      id: sameName && saved.playerId ? saved.playerId : `local_${Date.now()}`,
       name,
-      avatar: (saved && saved.playerName === name && saved.playerAvatar) || Math.floor(Math.random() * 8)
+      avatar: (sameName && saved.playerAvatar) || Math.floor(Math.random() * 8)
     };
+    playerRef.current = newPlayer;
     setPlayer(newPlayer);
+    // 昵称也落盘：joinRoom 判定"要不要带上重连凭证"时会比对它
+    writeSaved({ ...(saved || {}), playerName: name, playerAvatar: newPlayer.avatar });
     return newPlayer;
   };
 
@@ -270,9 +312,18 @@ function App() {
   };
 
   const leaveRoom = () => {
-    if (room) {
-      socket.emit('leaveRoom', { roomId: room.id, playerId: player.id });
+    if (room && socket) {
+      socket.emit('leaveRoom', { roomId: room.id, playerId: player?.id });
     }
+    // 主动退出：服务端已摘掉座位并回收了凭证，本地也清干净，
+    // 免得下次进房还拿着一份失效的 token 去比对
+    const saved = readSaved();
+    if (saved) {
+      delete saved.sessionToken;
+      delete saved.roomId;
+      writeSaved(saved);
+    }
+    roomRef.current = null;
     setRoom(null);
     setGameResult(null);
     setRoundResult(null);
@@ -328,6 +379,12 @@ function App() {
 
   const handleAssignPlayerTeam = (playerIndex, team) => {
     socket.emit('assignPlayerTeam', { roomId: room.id, playerIndex, team, playerId: player.id });
+  };
+
+  // 房主长按拖动：把两名玩家所在队伍互换（保 2v2）
+  const handleSwapPlayers = (indexA, indexB) => {
+    if (!room || !socket) return;
+    socket.emit('swapPlayerTeams', { roomId: room.id, indexA, indexB, playerId: player.id });
   };
 
   const handlePlayerReady = () => {
@@ -392,6 +449,7 @@ function App() {
           onStart={startGame}
           onSetTeamMode={handleSetTeamMode}
           onAssignPlayerTeam={handleAssignPlayerTeam}
+          onSwapPlayers={handleSwapPlayers}
           onPlayerReady={handlePlayerReady}
         />
       )}
