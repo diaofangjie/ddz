@@ -64,13 +64,21 @@ function makeClient(name, id) {
     // 若在牌局推进后再读 lastRoom，地主可能已收底牌、弃牌阶段可能已减牌，断言必然误判。
     dealSnapshot: null,
     sawDipai3: false,
-    noAutoDrive: false
+    noAutoDrive: false,
+    // 服务端签发的重连凭证（只在 createRoom/joinRoom 的回包里出现）
+    sessionToken: null
   };
 }
 
 function onRoomUpdate(client, r) {
   client.lastRoom = r;
   if (r && r.id) client.roomId = r.id;
+
+  // 身份由服务端签发：收到 you 就采纳（服务端会丢弃我们自报的 playerId）
+  if (r && r.you && r.you.id) {
+    client.playerId = r.you.id;
+    if (r.you.sessionToken) client.sessionToken = r.you.sessionToken;
+  }
 
   // ---- 首次出现手牌时冻结一份快照（发牌瞬间）----
   if (!client.dealSnapshot && r && r.game && Array.isArray(r.game.hands)
@@ -119,7 +127,7 @@ function attach(client) {
   const handle = (r) => onRoomUpdate(client, r);
   s.on('roomCreated', handle);
   s.on('joinedRoom', handle);
-  s.on('roomUpdated', handle);
+  s.on('roomUpdated', (r) => { client.lastBroadcast = r; handle(r); });
   s.on('gameStarted', handle);
   s.on('gameUpdated', handle);
   s.on('roundEnded', (r) => { client.roundEnds.push(r); onRoomUpdate(client, r.room); });
@@ -424,6 +432,98 @@ async function main() {
 
     outsider.close();
     sec.forEach((c) => c.socket.close());
+    await wait(300);
+
+    /* ============ 场景 2b：会话令牌（P0-4） ============ */
+    // 背景：playerId 会随 players[] 广播给房间内所有人，属于公开信息。
+    // 若服务端"看到相同 id 就当重连"，任何同房间玩家都能顶替他人座位、看光手牌。
+    // 这里同时验证两件事：
+    //   A. 合法重连（持 token）能拿回同一个身份
+    //   B. 拿着别人的 playerId 但不持 token 时，无法顶替
+    console.log('\n=== 场景 2b：会话令牌（合法重连 / 拒绝顶替）===');
+    // playerId 故意传 null：服务端才是身份权威，测试不能拿预设值蒙混过关
+    const host = makeClient('HOST', null);
+    host.noAutoDrive = true;
+    host.socket = await connect();
+    attach(host);
+    await wait(150);
+    host.socket.emit('createRoom', {
+      player: { id: 'forged_initial_id', name: 'HOST', avatar: 0 },
+      mode: '3player', rounds: 1, laiziMode: 'none', maxMultiplier: 64,
+      isAI: false, turnTimeLimit: 0, isNoShuffle: false
+    });
+    // 等 sessionToken 而不是 playerId：token 只可能来自服务端
+    await until(() => host.sessionToken, 6000, 'HOST 建房并拿到服务端签发身份');
+
+    const hostId = host.playerId;
+    const hostRoomId = host.roomId;
+    const hostToken = host.sessionToken;
+    check('服务端签发随机 playerId（形如 p_ + 24 位十六进制）',
+      /^p_[0-9a-f]{24}$/.test(hostId || ''), `id=${hostId}`);
+    check('客户端自报的 forged_initial_id 被丢弃', hostId !== 'forged_initial_id', `id=${hostId}`);
+    check('服务端签发 256 位 sessionToken',
+      typeof hostToken === 'string' && /^[0-9a-f]{64}$/.test(hostToken),
+      `token=${hostToken ? hostToken.length + ' 字符' : '缺失'}`);
+    check('定向回包（roomCreated）里带 token 给本人',
+      host.lastRoom?.you?.sessionToken === hostToken);
+
+    // --- A. 合法重连：断开后用 token 重新入房，应拿回同一个身份 ---
+    host.socket.close();
+    await wait(300);
+    const hostRe = makeClient('HOST', null);
+    hostRe.noAutoDrive = true;
+    hostRe.socket = await connect();
+    attach(hostRe);
+    await wait(150);
+    hostRe.socket.emit('joinRoom', {
+      roomId: hostRoomId,
+      player: { id: 'another_forged_id', name: 'HOST', avatar: 0 },
+      sessionToken: hostToken
+    });
+    const reconnected = await until(() => hostRe.playerId && hostRe.lastRoom, 6000, 'HOST 持 token 重连');
+    check('持有效 token 重连后拿回同一身份', reconnected && hostRe.playerId === hostId,
+      `重连得到 ${hostRe.playerId}，原身份 ${hostId}`);
+    check('重连未在房间里新增座位',
+      !!hostRe.lastRoom && hostRe.lastRoom.players.length === 1,
+      `players=${hostRe.lastRoom?.players?.length}`);
+
+    // --- B. 顶替尝试：拿到别人的 playerId 但没有 token ---
+    const attacker = await connect();
+    const attackerResult = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve({ timeout: true }), 4000);
+      attacker.once('joinedRoom', (r) => { clearTimeout(t); resolve({ joined: r }); });
+      attacker.once('error', (e) => { clearTimeout(t); resolve({ error: e }); });
+      // 关键：id 用受害者的真实 playerId，但不带 sessionToken
+      attacker.emit('joinRoom', {
+        roomId: hostRoomId,
+        player: { id: hostId, name: 'HOST' }
+      });
+    });
+
+    check('顶替尝试有明确结果（不是静默超时）',
+      !attackerResult.timeout, attackerResult.timeout ? '无任何响应' : 'ok');
+
+    const attackerId = attackerResult.joined?.you?.id;
+    check('拿到他人 playerId 但不持 token 时无法顶替',
+      !!attackerId && attackerId !== hostId,
+      attackerId ? (attackerId === hostId ? `顶替成功，拿到 ${attackerId}` : `被降级为新玩家 ${attackerId}`) : '被拒绝');
+    check('顶替失败时房间里仍只有一个 HOST 座位',
+      attackerResult.joined
+        ? attackerResult.joined.players.filter((p) => p.id === hostId).length === 1
+        : true,
+      attackerResult.joined
+        ? `hostId 座位数=${attackerResult.joined.players.filter((p) => p.id === hostId).length}`
+        : (attackerResult.error?.message || '无响应'));
+
+    await wait(300);
+    check('广播载荷（roomUpdated）里绝不含 sessionToken',
+      !!hostRe.lastBroadcast && JSON.stringify(hostRe.lastBroadcast).indexOf(hostToken) === -1,
+      hostRe.lastBroadcast ? `broadcast 字节数=${JSON.stringify(hostRe.lastBroadcast).length}` : '未收到广播');
+    check('广播载荷里 players[] 也不含 token',
+      !!hostRe.lastBroadcast && JSON.stringify(hostRe.lastBroadcast.players).indexOf(hostToken) === -1);
+
+    attacker.close();
+    hostRe.socket.close();
     await wait(300);
 
     /* ============ 场景 3：4 人自定义变体 ============ */

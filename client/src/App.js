@@ -13,6 +13,44 @@ const AppContainer = styled.div`
   flex-direction: column;
 `;
 
+const CONN_KEY = 'ddz_last_connection';
+
+function readSaved() {
+  try {
+    return JSON.parse(localStorage.getItem(CONN_KEY) || 'null');
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 采纳服务端签发的身份。
+ *
+ * 服务端才是身份的权威来源：它会丢掉我们自报的 playerId，换成随机 id，
+ * 并通过 `you` 字段告诉我们"你是谁"。重连凭证 sessionToken 只在
+ * createRoom / joinRoom 的定向回包里出现一次，需要持久化保存。
+ */
+function adoptYou(payload, setPlayer) {
+  if (!payload || !payload.you || !payload.you.id) return;
+
+  const serverId = payload.you.id;
+  const saved = readSaved() || {};
+
+  // 用函数式更新，避免 socket 回调闭包拿到过期的 player
+  setPlayer((prev) => {
+    if (prev && prev.id === serverId) return prev;
+    return {
+      id: serverId,
+      name: prev?.name || saved.playerName,
+      avatar: prev?.avatar ?? saved.playerAvatar ?? 0
+    };
+  });
+
+  const next = { ...saved, playerId: serverId, roomId: payload.id };
+  if (payload.you.sessionToken) next.sessionToken = payload.you.sessionToken;
+  localStorage.setItem(CONN_KEY, JSON.stringify(next));
+}
+
 function App() {
   const [socket, setSocket] = useState(null);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -77,17 +115,7 @@ function App() {
     newSocket.on('roomCreated', (r) => {
       setRoom(r);
       setScreen('room');
-      // 保存连接信息用于重连
-      if (player) {
-        const saveInfo = {
-          playerId: player.id,
-          playerName: player.name,
-          playerAvatar: player.avatar,
-          roomId: r.id
-        };
-        localStorage.setItem('ddz_last_connection', JSON.stringify(saveInfo));
-        setLastConnectionInfo(saveInfo);
-      }
+      adoptYou(r, setPlayer);
     });
 
     newSocket.on('joinedRoom', (r) => {
@@ -98,21 +126,12 @@ function App() {
       } else {
         setScreen('room');
       }
-      // 保存连接信息用于重连
-      if (player) {
-        const saveInfo = {
-          playerId: player.id,
-          playerName: player.name,
-          playerAvatar: player.avatar,
-          roomId: r.id
-        };
-        localStorage.setItem('ddz_last_connection', JSON.stringify(saveInfo));
-        setLastConnectionInfo(saveInfo);
-      }
+      adoptYou(r, setPlayer);
     });
 
     newSocket.on('roomUpdated', (r) => {
       setRoom({ ...r });
+      adoptYou(r, setPlayer);
       if (r.gameState === 'playing' && r.game) {
         setScreen('game');
       }
@@ -124,6 +143,7 @@ function App() {
 
     newSocket.on('gameStarted', (r) => {
       setRoom(r);
+      adoptYou(r, setPlayer);
       setRoundResult(null);
       setGameResult(null);
       setGameHint('');
@@ -132,12 +152,14 @@ function App() {
 
     newSocket.on('gameUpdated', (r) => {
       setRoom({ ...r });
+      adoptYou(r, setPlayer);
       setGameHint('');
     });
 
     newSocket.on('gameEnded', (result) => {
       if (result.room) {
         setRoom(result.room);
+        adoptYou(result.room, setPlayer);
       }
       setRoundResult(null);
       setGameResult(result);
@@ -147,6 +169,7 @@ function App() {
     newSocket.on('roundEnded', (result) => {
       if (result.room) {
         setRoom(result.room);
+        adoptYou(result.room, setPlayer);
       }
       setGameResult(null);
       setRoundResult(result);
@@ -170,25 +193,17 @@ function App() {
   }, []);
 
   const createPlayer = (name) => {
-    // 先检查是否有保存的信息
-    const savedInfo = JSON.parse(localStorage.getItem('ddz_last_connection') || 'null');
+    const saved = readSaved();
 
-    let newPlayer;
-    if (savedInfo && savedInfo.playerName === name) {
-      // 如果是相同的名字，使用保存的ID
-      newPlayer = {
-        id: savedInfo.playerId,
-        name: name,
-        avatar: savedInfo.playerAvatar || Math.floor(Math.random() * 8)
-      };
-    } else {
-      // 新玩家
-      newPlayer = {
-        id: Date.now().toString(),
-        name,
-        avatar: Math.floor(Math.random() * 8)
-      };
-    }
+    // 注意：id 只是本地占位，服务端会丢掉它并签发权威 id（见 adoptYou）。
+    // 因此这里用什么值都不影响安全，重连靠的是 sessionToken。
+    const newPlayer = {
+      id: (saved && saved.playerName === name && saved.playerId)
+        ? saved.playerId
+        : `local_${Date.now()}`,
+      name,
+      avatar: (saved && saved.playerName === name && saved.playerAvatar) || Math.floor(Math.random() * 8)
+    };
     setPlayer(newPlayer);
     return newPlayer;
   };
@@ -216,7 +231,12 @@ function App() {
     if (!currentPlayer && playerName) {
       currentPlayer = createPlayer(playerName);
     }
-    socket.emit('joinRoom', { roomId, player: currentPlayer });
+    // 只有"房间号 + 名字都对得上"时才带上 token，避免拿着 A 房的 token 去 B 房
+    const saved = readSaved();
+    const sessionToken = (saved && saved.playerName === currentPlayer?.name && saved.roomId === roomId)
+      ? saved.sessionToken
+      : undefined;
+    socket.emit('joinRoom', { roomId, player: currentPlayer, sessionToken });
   };
 
   // 断线重连函数
@@ -226,7 +246,7 @@ function App() {
       return;
     }
     // 先检查本地存储是否有保存的连接信息
-    const savedInfo = JSON.parse(localStorage.getItem('ddz_last_connection') || 'null');
+    const savedInfo = readSaved();
 
     const usePlayerName = playerName || savedInfo?.playerName;
     const useRoomId = roomId || savedInfo?.roomId;
@@ -236,13 +256,17 @@ function App() {
       return;
     }
 
-    // 尝试用相同的ID重连（如果没有保存过，则创建新ID）
     let currentPlayer = player;
     if (!currentPlayer) {
       currentPlayer = createPlayer(usePlayerName);
     }
 
-    socket.emit('joinRoom', { roomId: useRoomId, player: currentPlayer });
+    // 重连凭证：服务端只认 token，不认 playerId
+    socket.emit('joinRoom', {
+      roomId: useRoomId,
+      player: currentPlayer,
+      sessionToken: savedInfo?.sessionToken
+    });
   };
 
   const leaveRoom = () => {

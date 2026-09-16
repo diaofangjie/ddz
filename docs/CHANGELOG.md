@@ -18,10 +18,13 @@
 ## [Unreleased]
 
 ### 安全
+- **身份改由服务端签发 + 会话令牌（P0-4）**：`createRoom` / `joinRoom` 一律丢弃客户端自报的 `player.id`，改为服务端 `crypto` 随机生成；重连必须出示 256 位 `sessionToken`。
+  - 修复的漏洞：`playerId` 会随 `players[]` 广播给房间内所有人（公开信息），而服务端此前"看到相同 id 即视为重连"并跳过满员检查 —— **同房间任何玩家都能用别人的 id 顶替对方座位、看光对方手牌并替对方出牌**，使手牌裁剪形同虚设。现在该分支只认 token，且 token 只回给本人、绝不进入任何广播载荷。
+  - 提醒：这是**协议变更**，服务端与前端必须同时部署，否则旧页面重连会失败。
 - **手牌不再全量广播**：服务端改为按观察者逐人裁剪（`projectGame`）。每个客户端收到的 `game.hands` 中只有自己是真实牌，其余用等长占位牌（`rank:'hidden'`）替代，前端仅使用其 `length` 渲染牌背。打开 DevTools 也看不到对手手牌。
 - **底牌在地主确定前不下发**，杜绝抢地主阶段偷看。
-- **身份与 socket 强绑定**：新增 `authorize(socket, roomId)`，所有动作一律以服务端记录的 socket ↔ player 映射为准，payload 里的 `playerId` 被忽略，无法替他人出牌或发言。
-- **移除"同名即重连"**：只按 `playerId` 匹配身份，抢注昵称不再能顶替他人。
+- **身份与 socket 强绑定**：所有动作一律以服务端记录的 socket ↔ player 映射为准，payload 里的 `playerId` 被忽略，无法替他人出牌或发言。
+- **移除"同名即重连"**：抢注昵称不再能顶替他人。
 
 ### 修复
 - **修复托管/AI 自动出牌崩溃（牌局卡死）**：`aiDecidePlayCards` 的炸弹分支未做"能否压过上家"校验，4 人双副牌下返回的 4 张同点压不过对手 5~8 张炸弹，抛 `PLAY_TOO_SMALL` 导致整局中断。现所有炸弹候选都经 `evaluateHand` + `compareHands` 校验后才返回，压不过则过牌；`applyDefaultAction` 另加一层兜底，保证状态机永远可推进。
@@ -36,8 +39,9 @@
 ### 新增
 - **自动化测试网**：
   - `server/test/ai-play.unit.js` — 属性化回归，4000+ 次决策校验 AI 出牌合法性。
-  - `server/test/flow.e2e.js` — 端到端 4 场景 35 项断言（3 人局全流程 / 身份绑定 / 4 人 2v2 变体 / 10 人并发）。
-- **版本控制**：`git init` + 补全 `.gitignore`，远端指向 `github.com/diaofangjie/ddz.git`。
+  - `server/test/flow.e2e.js` — 端到端 5 场景 **46 项断言**（3 人局全流程 / 身份绑定 / 会话令牌 / 4 人 2v2 变体 / 10 人并发）。
+- **发布部署运行手册**：`docs/07-发布部署运行手册.md`，含线上现状实测、两种发布路径、验收清单（含安全修复专项验证）、回滚与已踩过的坑。
+- **版本控制**：`git init` + 补全 `.gitignore`，远端 `github.com/diaofangjie/ddz.git` 已同步。
 
 ### 变更
 - 超时、离线托管、AI 三段重复逻辑合并为唯一实现 `applyDefaultAction(room, player)`。
@@ -48,11 +52,11 @@
 - 源码审计识别 6 项 P0 与 8 项 P1 风险，并记录本轮修复进展，详见 `docs/00-现状审计与风险清单.md` 第 6 节。
 
 ### 待办（尚未开始）
-- 推送本地提交到 GitHub（需授权凭据）
-- 完整的 `sessionToken` 会话机制
+- 将本次修复部署到线上 `8.137.195.155`（见 `docs/07-发布部署运行手册.md`）
 - HTTPS（证书 + Nginx 终结 TLS）
 - 状态持久化（SQLite 起步）
-- 前端 15 条既有 lint 警告清理（`CI=true` 时会导致构建失败）
+- Nginx 反向代理 `/socket.io`，关掉 3001 公网暴露
+- 前端既有 lint 警告清理（`CI=true` 时会导致构建失败）
 
 ---
 

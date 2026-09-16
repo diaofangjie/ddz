@@ -114,7 +114,12 @@ function serializeRoom(room, viewerId) {
       }))
       : [],
     lastRoundResult: room.lastRoundResult ? { ...room.lastRoundResult } : null,
-    autoReadyDeadline: room.autoReadyDeadline || null
+    autoReadyDeadline: room.autoReadyDeadline || null,
+    // 告诉观察者"你是谁"。
+    // 注意：这里只带 playerId，**绝不带 sessionToken** —— 该载荷会广播给房间内所有人，
+    // 一旦带上 token 就等于把重连凭证发给全场（这正是"顶替他人"漏洞的成因）。
+    // token 只在 createRoom/joinRoom 的定向回包中出现。
+    you: viewerId ? { id: viewerId, sessionToken: null } : null
   };
 }
 
@@ -451,13 +456,17 @@ io.on('connection', (socket) => {
 
   socket.on('createRoom', (data) => {
     try {
-      if (!data || !data.player || !data.player.id) {
+      if (!data || !data.player) {
         throw createError('缺少玩家信息', 'INVALID_PLAYER');
       }
-      const room = roomManager.createRoom(data, socket.id);
-      socket.data.playerId = data.player.id;
+      // 身份由服务端签发，客户端自报的 player.id 被丢弃（见 RoomManager.createRoom）
+      const { room, session } = roomManager.createRoom(data, socket.id);
+      socket.data.playerId = session.playerId;
       socket.join(room.id);
-      socket.emit('roomCreated', serializeRoom(room, data.player.id));
+      socket.emit('roomCreated', {
+        ...serializeRoom(room, session.playerId),
+        you: { id: session.playerId, sessionToken: session.token }
+      });
       broadcastRoomList();
     } catch (error) {
       socket.emit('error', { message: error.message, code: error.code || 'CREATE_ROOM_FAILED' });
@@ -466,14 +475,20 @@ io.on('connection', (socket) => {
 
   socket.on('joinRoom', (data) => {
     try {
-      if (!data || !data.player || !data.player.id) {
+      if (!data || !data.player) {
         throw createError('缺少玩家信息', 'INVALID_PLAYER');
       }
-      const room = roomManager.joinRoom(data.roomId, data.player, socket.id);
-      socket.data.playerId = data.player.id;
+      // data.sessionToken 是唯一可信的重连凭证；缺失则按新玩家处理，由服务端签发新身份
+      const { room, session } = roomManager.joinRoom(
+        data.roomId, data.player, socket.id, data.sessionToken
+      );
+      socket.data.playerId = session.playerId;
       socket.join(room.id);
+      socket.emit('joinedRoom', {
+        ...serializeRoom(room, session.playerId),
+        you: { id: session.playerId, sessionToken: session.token }
+      });
       broadcastRoomState(room);
-      socket.emit('joinedRoom', serializeRoom(room, data.player.id));
       broadcastRoomList();
     } catch (error) {
       socket.emit('error', { message: error.message, code: error.code || 'JOIN_ROOM_FAILED' });

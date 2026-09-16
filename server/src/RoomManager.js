@@ -1,13 +1,63 @@
+const crypto = require('crypto');
+
 class RoomManager {
   constructor() {
     this.rooms = new Map();
     this.playerRoomMap = new Map();
     this.socketPlayerMap = new Map();
+    // 会话表：sessionToken -> { playerId, roomId }
+    //
+    // 为什么需要它：玩家身份此前是"客户端自己生成的 playerId"，而这个 id
+    // 会被 serializeRoom 原样广播给房间内所有人（players[] 数组）。
+    // 于是同房间任何人只要拿到别人的 id，就能用 joinRoom 走"断线重连"分支，
+    // 把自己的 socket 绑到对方身份上 —— 看光对方手牌并替对方出牌，
+    // 使视图裁剪形同虚设。
+    //
+    // 现在身份一律由服务端签发（crypto 随机），重连必须出示 token；
+    // token 只回给本人，绝不进入任何广播载荷。
+    this.sessions = new Map();
     this.cleanupInterval = null;
   }
 
   generateRoomId() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
+  }
+
+  /**
+   * 签发一份新会话：不可猜测的 playerId + 只在本人通道回传的 sessionToken。
+   * 用 128 位随机而非 Date.now()，杜绝"枚举时间戳顶替他人"。
+   */
+  issueSession(roomId) {
+    const session = {
+      playerId: `p_${crypto.randomBytes(12).toString('hex')}`,
+      token: crypto.randomBytes(32).toString('hex'),
+      roomId
+    };
+    this.sessions.set(session.token, { playerId: session.playerId, roomId });
+    return session;
+  }
+
+  /** 用 token 解析身份；token 无效或房间不匹配都返回 null（不泄露任何信息） */
+  resolveSession(token, roomId) {
+    if (!token) return null;
+    const record = this.sessions.get(token);
+    if (!record) return null;
+    if (roomId && record.roomId !== roomId) return null;
+    return record;
+  }
+
+  /** 玩家离开房间时回收其会话，避免 token 长期有效 */
+  revokeSessionsOf(playerId) {
+    for (const [token, record] of this.sessions.entries()) {
+      if (record.playerId === playerId) this.sessions.delete(token);
+    }
+  }
+
+  /** 房间被销毁时回收该房间的全部会话 */
+  revokeRoomSessions(roomId) {
+    for (const [token, record] of this.sessions.entries()) {
+      if (record.roomId === roomId) this.sessions.delete(token);
+    }
   }
 
   /**
@@ -53,7 +103,13 @@ class RoomManager {
 
   createRoom(data, socketId) {
     const roomId = this.generateRoomId();
+
+    // 身份由服务端签发：无论客户端自报什么 id，都一律丢弃并换成随机 id。
+    // 客户端拿到的 id 只用于它自己在 players[] 里认座位，不能作为凭证。
+    const session = this.issueSession(roomId);
+    data.player.id = session.playerId;
     data.player.isOffline = false;
+
     const room = {
       id: roomId,
       players: [data.player],
@@ -89,54 +145,57 @@ class RoomManager {
     }
 
     this.rooms.set(roomId, room);
-    this.playerRoomMap.set(data.player.id, roomId);
-    this.bindSocket(socketId, data.player.id);
-    return room;
+    this.playerRoomMap.set(session.playerId, roomId);
+    this.bindSocket(socketId, session.playerId);
+    return { room, session };
   }
 
-  joinRoom(roomId, player, socketId) {
+  /**
+   * 加入（或重连回）房间。
+   *
+   * @param {object} player    客户端自报的玩家信息，**只有 name/avatar 会被采用**
+   * @param {string} token     客户端持有的 sessionToken；首次入房为空
+   * @returns {{room: object, session: {playerId: string, token: string}, reconnected: boolean}}
+   */
+  joinRoom(roomId, player, socketId, token) {
     const room = this.rooms.get(roomId);
     if (!room) throw new Error('房间不存在');
 
     const maxPlayers = room.settings.mode === '4player' ? 4 : 3;
 
-    // 只按 player.id 匹配。
-    // 安全说明：此前的"同名即可重连"分支允许任何人输入他人昵称顶替其座位、
-    // 接管其手牌，属于身份伪造漏洞，已移除。
-    // 正常重连由客户端 localStorage 中持久化的 playerId 完成（同设备刷新即可）；
-    // 换设备/清缓存后需由房主重新开局，或等待后续引入服务端签发的 reconnectKey。
-    const existingPlayer = room.players.find(p => p.id === player.id);
+    // ⚠️ 重连只认服务端签发的 token，绝不能"player.id 命中就当重连"。
+    // player.id 会随 players[] 广播给房间内所有人，属于公开信息；
+    // 用它当凭证 = 同房间任何人都能顶替他人座位、看光手牌。
+    const record = this.resolveSession(token, roomId);
+    const known = record ? room.players.find(p => p.id === record.playerId) : null;
 
-    if (existingPlayer) {
-      // 这是断线重连，重新激活玩家
-      existingPlayer.isOffline = false;
-      // 更新玩家ID（因为刷新页面后ID可能变了）
-      const oldId = existingPlayer.id;
-      existingPlayer.id = player.id;
-      // 如果玩家名有变化，也更新
-      if (player.name) {
-        existingPlayer.name = player.name;
-      }
-      // 更新地图
-      this.playerRoomMap.delete(oldId);
-      this.playerRoomMap.set(player.id, roomId);
-      this.bindSocket(socketId, player.id);
-      // 玩家上线，更新 emptySince
+    if (known) {
+      known.isOffline = false;
+      if (player && player.name) known.name = player.name;
+      this.playerRoomMap.set(known.id, roomId);
+      this.bindSocket(socketId, known.id);
       this.updateEmptySince(room);
-      return room;
+      return { room, session: { playerId: known.id, token }, reconnected: true };
     }
 
-    // 新玩家加入
+    // 新玩家：身份同样由服务端签发，客户端自报的 id 一律丢弃
     const currentPlayers = room.players.filter(p => !p.isOffline).length;
     if (currentPlayers >= maxPlayers) throw new Error('房间已满');
 
-    player.isOffline = false;
-    room.players.push(player);
-    this.playerRoomMap.set(player.id, roomId);
-    this.bindSocket(socketId, player.id);
-    // 新玩家加入，更新 emptySince
+    const session = this.issueSession(roomId);
+    const newPlayer = {
+      id: session.playerId,
+      name: (player && player.name) || '玩家',
+      avatar: player && typeof player.avatar === 'number' ? player.avatar : 0,
+      isAI: false,
+      isOffline: false
+    };
+
+    room.players.push(newPlayer);
+    this.playerRoomMap.set(newPlayer.id, roomId);
+    this.bindSocket(socketId, newPlayer.id);
     this.updateEmptySince(room);
-    return room;
+    return { room, session, reconnected: false };
   }
 
   canStartGame(room) {
@@ -173,6 +232,7 @@ class RoomManager {
     // 如果所有非AI玩家都完全离开了（不是仅仅离线），立即删除房间
     if (room.players.filter(p => !p.isAI).length === 0) {
       this.rooms.delete(roomId);
+      this.revokeRoomSessions(roomId);
       return null;
     }
 
@@ -289,6 +349,7 @@ class RoomManager {
 
     // 删除房间
     this.rooms.delete(roomId);
+    this.revokeRoomSessions(roomId);
     console.log(`[RoomManager] 房间 ${roomId} 已被自动清理`);
   }
 
