@@ -49,6 +49,10 @@ repomix-output.xml
 *.tmp
 *.bak
 
+# 部署/调试脚本的输出重定向文件（PowerShell 里写 _xxx.txt 抓 stdout 用，不入库）
+_*.txt
+_*.out
+
 # 运行时数据（阶段 3 引入持久化后启用）
 data/*.json
 data/*.sqlite
