@@ -5,6 +5,17 @@ import RoomScreen from './components/RoomScreen';
 import GameScreen from './components/GameScreen';
 import styled from 'styled-components';
 import config from './config';
+import {
+  readConn,
+  writeConn,
+  clearReconnect,
+  writeNickname,
+  initTabScopedStorage
+} from './storage';
+
+// ⚠️ 必须在任何读存储的代码之前执行：
+// 落实本标签页独立的身份槽位，识别并拆掉"复制标签页"继承来的身份。
+initTabScopedStorage();
 
 const AppContainer = styled.div`
   width: 100%;
@@ -13,26 +24,6 @@ const AppContainer = styled.div`
   flex-direction: column;
 `;
 
-const CONN_KEY = 'ddz_last_connection';
-
-function readSaved() {
-  try {
-    return JSON.parse(localStorage.getItem(CONN_KEY) || 'null');
-  } catch (e) {
-    return null;
-  }
-}
-
-function writeSaved(info) {
-  try {
-    localStorage.setItem(CONN_KEY, JSON.stringify(info));
-    return true;
-  } catch (e) {
-    console.error('保存连接信息失败', e);
-    return false;
-  }
-}
-
 /**
  * 采纳服务端签发的身份。
  *
@@ -40,17 +31,15 @@ function writeSaved(info) {
  * 并通过 `you` 字段告诉我们"你是谁"。重连凭证 sessionToken 只在
  * createRoom / joinRoom 的定向回包里出现一次，需要持久化保存。
  *
- * ⚠️ playerName / playerAvatar 必须一起落盘。
- * joinRoom 就是靠 `saved.playerName === 当前名字 && saved.roomId === 房间号`
- * 来决定要不要带上 sessionToken 的；这两个字段一直没被写过，条件恒为 false，
- * 于是"退出再进"永远走不到重连分支，只会在服务端多推一条记录 ——
- * 房间里同一个人就同时有了「在线」和「离线」两份，人数直接对不上。
+ * ⚠️ 凭证一律写 sessionStorage（按标签页隔离），见 ./storage 的说明。
+ * 写进 localStorage 会让同浏览器多窗口共用同一个 token，
+ * 服务端把 4 个窗口判成"同一人重连"，房间里永远只有 1 个玩家。
  */
 function adoptYou(payload, setPlayer, playerRef) {
   if (!payload || !payload.you || !payload.you.id) return;
 
   const serverId = payload.you.id;
-  const saved = readSaved() || {};
+  const saved = readConn() || {};
   const prev = playerRef.current;
   const name = (prev && prev.name) || saved.playerName || '玩家';
   const avatar = prev && prev.avatar !== undefined ? prev.avatar : (saved.playerAvatar || 0);
@@ -69,7 +58,7 @@ function adoptYou(payload, setPlayer, playerRef) {
     playerAvatar: avatar
   };
   if (payload.you.sessionToken) next.sessionToken = payload.you.sessionToken;
-  writeSaved(next);
+  writeConn(next);
 }
 
 function App() {
@@ -96,7 +85,7 @@ function App() {
 
   // 优先从本地存储恢复玩家信息
   useEffect(() => {
-    const savedInfo = readSaved();
+    const savedInfo = readConn();
     if (savedInfo) {
       setLastConnectionInfo(savedInfo);
       // 如果有保存的玩家信息，自动恢复
@@ -127,7 +116,7 @@ function App() {
 
       // 断线重连后主动认领回原座位。座位和房主身份都还在服务端留着，
       // 不出示 token 的话服务端只会把我们当成新玩家，多出一条幽灵记录。
-      const saved = readSaved();
+      const saved = readConn();
       const currentRoom = roomRef.current;
       if (saved && saved.sessionToken && saved.roomId
         && currentRoom && currentRoom.id === saved.roomId) {
@@ -233,7 +222,10 @@ function App() {
   }, []);
 
   const createPlayer = (name) => {
-    const saved = readSaved();
+    // ⚠️ 这里读的是**本标签页**的连接记录（sessionStorage）。
+    // 新开一个窗口/标签页时它是空的，于是每个窗口都会拿到各自独立的身份 ——
+    // 这正是"本机多开窗口测多人"能跑通的前提。
+    const saved = readConn();
     const sameName = !!(saved && saved.playerName === name);
 
     // 注意：id 只是本地占位，服务端会丢掉它并签发权威 id（见 adoptYou）。
@@ -245,8 +237,10 @@ function App() {
     };
     playerRef.current = newPlayer;
     setPlayer(newPlayer);
-    // 昵称也落盘：joinRoom 判定"要不要带上重连凭证"时会比对它
-    writeSaved({ ...(saved || {}), playerName: name, playerAvatar: newPlayer.avatar });
+    writeConn({ ...(saved || {}), playerName: name, playerAvatar: newPlayer.avatar });
+    // 昵称另外记一份到 localStorage（跨窗口共享），只用于下次打开输入框预填，
+    // 不参与任何身份判定 —— 身份只看上面的 sessionStorage 记录。
+    writeNickname(name);
     return newPlayer;
   };
 
@@ -274,7 +268,7 @@ function App() {
       currentPlayer = createPlayer(playerName);
     }
     // 只有"房间号 + 名字都对得上"时才带上 token，避免拿着 A 房的 token 去 B 房
-    const saved = readSaved();
+    const saved = readConn();
     const sessionToken = (saved && saved.playerName === currentPlayer?.name && saved.roomId === roomId)
       ? saved.sessionToken
       : undefined;
@@ -288,7 +282,7 @@ function App() {
       return;
     }
     // 先检查本地存储是否有保存的连接信息
-    const savedInfo = readSaved();
+    const savedInfo = readConn();
 
     const usePlayerName = playerName || savedInfo?.playerName;
     const useRoomId = roomId || savedInfo?.roomId;
@@ -317,12 +311,7 @@ function App() {
     }
     // 主动退出：服务端已摘掉座位并回收了凭证，本地也清干净，
     // 免得下次进房还拿着一份失效的 token 去比对
-    const saved = readSaved();
-    if (saved) {
-      delete saved.sessionToken;
-      delete saved.roomId;
-      writeSaved(saved);
-    }
+    clearReconnect();
     roomRef.current = null;
     setRoom(null);
     setGameResult(null);

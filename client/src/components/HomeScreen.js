@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import styled from 'styled-components';
+import { readConn, readNickname, writeNickname } from '../storage';
 
 const Container = styled.div`
   flex: 1;
@@ -274,7 +275,9 @@ const EmptyList = styled.div`
 
 function HomeScreen({ onCreatePlayer, onCreateRoom, onJoinRoom, onReconnect, roomList = [], onRequestRoomList }) {
   const [name, setName] = useState(() => {
-    return localStorage.getItem('ddz_nickname') || '';
+    // 昵称只是输入框默认值，放 localStorage 跨窗口共享没问题。
+    // ⚠️ 真正决定"你是谁"的身份与重连凭证在 sessionStorage（见 ../storage）。
+    return readNickname();
   });
   const [showCreate, setShowCreate] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
@@ -296,19 +299,16 @@ function HomeScreen({ onCreatePlayer, onCreateRoom, onJoinRoom, onReconnect, roo
   const [savedInfo, setSavedInfo] = useState(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem('ddz_last_connection');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        setSavedInfo(parsed);
-        setHasSavedConnection(true);
-        setReconnectRoomId(parsed.roomId);
-        // 自动填充玩家名
-        if (parsed.playerName && !name) {
-          setName(parsed.playerName);
-        }
-      } catch (e) {
-        console.error('解析保存信息失败', e);
+    // 只认本标签页的连接记录：新开的窗口读不到别的窗口的身份，
+    // 因此不会出现"每个窗口都显示上一个窗口的房间号"的串味。
+    const saved = readConn();
+    if (saved && saved.roomId) {
+      setSavedInfo(saved);
+      setHasSavedConnection(true);
+      setReconnectRoomId(saved.roomId);
+      // 自动填充玩家名
+      if (saved.playerName && !name) {
+        setName(saved.playerName);
       }
     }
 
@@ -351,7 +351,7 @@ function HomeScreen({ onCreatePlayer, onCreateRoom, onJoinRoom, onReconnect, roo
         onChange={(e) => {
           const val = e.target.value;
           setName(val);
-          localStorage.setItem('ddz_nickname', val);
+          writeNickname(val);
         }}
         onKeyPress={(e) => e.key === 'Enter' && handleStart()}
       />
