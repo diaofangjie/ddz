@@ -13,11 +13,6 @@ app.use(express.json());
 // 托管前端构建后的静态资源
 app.use(express.static(path.join(__dirname, '../../client/build')));
 
-// 所有非 API 的请求都返回 index.html
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../../client/build', 'index.html'));
-});
-
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
@@ -681,6 +676,12 @@ io.on('connection', (socket) => {
     }
     broadcastRoomList();
   });
+});
+
+// 所有非 API 的请求都返回 index.html
+// ⚠️ 必须放在全部路由（含 /health）之后，否则通配符会把它们统统拦截掉
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../../client/build', 'index.html'));
 });
 
 const PORT = process.env.PORT || 3001;
