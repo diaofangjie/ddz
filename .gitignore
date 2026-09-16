@@ -36,6 +36,8 @@ coverage/
 
 # Release archives（部署包由发布流程生成，不入库）
 *.zip
+*.tgz
+*.tar.gz
 client/build.zip
 ddz-alibaba-deploy.zip
 
